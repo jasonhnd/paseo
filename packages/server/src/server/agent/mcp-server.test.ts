@@ -6,7 +6,6 @@ import { join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
 import Ajv from "ajv";
 import { z } from "zod";
-import { zodToJsonSchema } from "zod-to-json-schema";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { createAgentMcpServer } from "./mcp-server.js";
@@ -112,7 +111,7 @@ async function invokeToolWithParsedInput(
 
 function expectOutputSchemaAccepts(tool: RegisteredMcpTool, data: unknown): void {
   expect(tool.outputSchema).toBeDefined();
-  const jsonSchema = zodToJsonSchema(tool.outputSchema as z.ZodTypeAny);
+  const jsonSchema = z.toJSONSchema(tool.outputSchema as z.ZodTypeAny, { target: "draft-7" });
   const ajv = new Ajv({ allErrors: true, strict: false });
   const validate = ajv.compile(jsonSchema);
   expect(validate(data), JSON.stringify(validate.errors, null, 2)).toBe(true);

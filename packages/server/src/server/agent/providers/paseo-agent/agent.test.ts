@@ -483,6 +483,11 @@ describe("PaseoAgentSession runtime events", () => {
         contextWindowUsedTokens: 1234,
       },
       timeline: [
+        {
+          type: "user_message",
+          text: "hello",
+          messageId: expect.any(String),
+        },
         { type: "reasoning", text: "thinking" },
         {
           type: "tool_call",
@@ -504,6 +509,7 @@ describe("PaseoAgentSession runtime events", () => {
       ],
     });
     expect(events.map((event) => event.type)).toEqual([
+      "timeline",
       "thread_started",
       "turn_started",
       "timeline",
@@ -554,7 +560,13 @@ describe("PaseoAgentSession runtime events", () => {
     await expect(resultPromise).resolves.toMatchObject({
       sessionId: "pi-session-1",
       finalText: "",
-      timeline: [],
+      timeline: [
+        {
+          type: "user_message",
+          text: "cancel me",
+          messageId: expect.any(String),
+        },
+      ],
     });
     expect(fakePi.abortCalls).toBe(1);
     expect(events).toContainEqual({

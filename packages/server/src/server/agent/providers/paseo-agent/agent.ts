@@ -67,6 +67,7 @@ const PASEO_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsDynamicModes: false,
   // MCP servers from AgentSessionConfig.mcpServers are bridged to Pi custom tools.
   supportsMcpServers: true,
+  requiresPaseoTools: true,
   supportsReasoningStream: true,
   supportsToolInvocations: true,
 };
@@ -315,6 +316,18 @@ export class PaseoAgentSession implements AgentSession {
     });
   }
 
+  private emitSubmittedUserMessage(text: string, messageId: string, turnId: string): void {
+    if (text.trim().length === 0) {
+      return;
+    }
+    this.emit({
+      type: "timeline",
+      provider: PASEO_AGENT_PROVIDER,
+      turnId,
+      item: { type: "user_message", text, messageId },
+    });
+  }
+
   async run(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<AgentRunResult> {
     return runProviderTurn({
       prompt,
@@ -328,14 +341,16 @@ export class PaseoAgentSession implements AgentSession {
 
   async startTurn(
     prompt: AgentPromptInput,
-    _options?: AgentRunOptions,
+    options?: AgentRunOptions,
   ): Promise<{ turnId: string }> {
     if (this.activeTurnId) {
       throw new Error("A Paseo Agent turn is already active");
     }
     const payload = convertPromptInput(prompt);
     const turnId = randomUUID();
+    const messageId = options?.messageId ?? randomUUID();
     this.activeTurnId = turnId;
+    this.emitSubmittedUserMessage(payload.text, messageId, turnId);
 
     void this.piSession
       .prompt(payload.text, payload.images ? { images: payload.images } : undefined)

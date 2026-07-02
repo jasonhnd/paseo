@@ -19,6 +19,15 @@ instance and the `openai/gpt-4o-mini` model exposed by that instance.
 > `--host <addr>` to CLI smoke commands so they hit your isolated daemon, not the real
 > daemon on `:6767`.
 
+## Timeline and persistence
+
+Paseo Agent does not write or resume Pi CLI session files such as
+`~/.pi/agent/sessions/*`; it runs Pi's harness in process and currently reports no
+provider-owned session persistence. App refreshes and daemon-side agent reloads therefore
+depend on Paseo's own timeline rows, not on a Pi history replay. Submitted prompts must be
+emitted as `user_message` timeline rows when the turn starts; assistant text, reasoning,
+and tool calls arrive later from Pi events and are mapped into the same Paseo timeline.
+
 ## Provider catalog
 
 Paseo Agent model providers are catalog-driven, but Paseo does not copy Pi's provider
@@ -254,6 +263,9 @@ connect or list are logged and skipped rather than failing the session.
 Transports: HTTP (streamable) is the primary path (the injected `paseo` server is HTTP);
 SSE and stdio transports are also wired via the MCP SDK. No extra config is needed: MCP
 servers come from Paseo's normal injection/config, not from `agents.paseo`.
+
+The internal `paseo` MCP server is required for Paseo Agent sessions and is injected even
+when the global `mcp.injectIntoAgents` setting is disabled for other providers.
 
 ## Agent definitions
 

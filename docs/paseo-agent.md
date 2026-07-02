@@ -31,7 +31,7 @@ The current catalog contains four entries:
 
 | id            | Pi provider    | default models | auth source                                   |
 | ------------- | -------------- | -------------- | --------------------------------------------- |
-| `openrouter`  | `openrouter`   | none           | Pi env key `OPENROUTER_API_KEY`               |
+| `openrouter`  | `openrouter`   | none           | Paseo hint `OPENROUTER_API_KEY`               |
 | `chatgpt`     | `openai-codex` | Pi full list   | Pi OAuth registry (`openai-codex`)            |
 | `kimi`        | `kimi-coding`  | Pi full list   | Paseo hint `KIMI_API_KEY` (Pi has no env key) |
 | `opencode-go` | `opencode-go`  | Pi full list   | Paseo hint `OPENCODE_API_KEY`                 |

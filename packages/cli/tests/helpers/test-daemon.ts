@@ -43,6 +43,13 @@ const TEST_DAEMON_ENV_DEFAULTS: Record<string, string> = {
   PASEO_VOICE_MODE_ENABLED: process.env.PASEO_VOICE_MODE_ENABLED ?? "0",
 };
 const TEST_DAEMON_HOST = "127.0.0.1";
+// Keep in sync with catalog.ts api_key auth envVar hints. These are scrubbed so
+// local developer credentials cannot hide CI-missing-auth failures.
+const PASEO_AGENT_PROVIDER_AUTH_ENV_KEYS = [
+  "OPENROUTER_API_KEY",
+  "KIMI_API_KEY",
+  "OPENCODE_API_KEY",
+] as const;
 
 const DEFAULT_OUTPUT_CAPTURE_LIMIT = 256 * 1024;
 const TEST_OUTPUT_CAPTURE_LIMIT = Number.parseInt(
@@ -57,6 +64,14 @@ interface OutputCapture {
 
 function createOutputCapture(): OutputCapture {
   return { value: "", truncated: false };
+}
+
+function scrubPaseoAgentProviderAuthEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const scrubbed = { ...env };
+  for (const key of PASEO_AGENT_PROVIDER_AUTH_ENV_KEYS) {
+    delete scrubbed[key];
+  }
+  return scrubbed;
 }
 
 function appendOutputCapture(target: OutputCapture, chunk: Buffer): void {
@@ -234,7 +249,7 @@ export async function startTestDaemon(options?: {
 
   // Start daemon process using tsx to run TypeScript directly
   const daemonProcess = spawn("npx", ["tsx", cliSrcPath, "daemon", "start", "--foreground"], {
-    env: {
+    env: scrubPaseoAgentProviderAuthEnv({
       ...process.env,
       ...TEST_DAEMON_ENV_DEFAULTS,
       PASEO_HOME: paseoHome,
@@ -242,7 +257,7 @@ export async function startTestDaemon(options?: {
       // Force no TTY to prevent QR code output
       CI: "true",
       ...options?.env,
-    },
+    }),
     stdio: ["ignore", "pipe", "pipe"],
     detached: process.platform !== "win32",
   });
@@ -347,13 +362,13 @@ export async function runPaseoCli(
 
   return new Promise((resolve, reject) => {
     const proc = spawn("npx", ["tsx", cliSrcPath, ...args], {
-      env: {
+      env: scrubPaseoAgentProviderAuthEnv({
         ...process.env,
         ...TEST_DAEMON_ENV_DEFAULTS,
         PASEO_HOST: `${TEST_DAEMON_HOST}:${ctx.port}`,
         PASEO_HOME: ctx.paseoHome,
         ...options?.env,
-      },
+      }),
       cwd,
       stdio: [options?.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",

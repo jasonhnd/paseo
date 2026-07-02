@@ -2,7 +2,7 @@ import type { KnownProvider } from "@earendil-works/pi-ai";
 
 export interface PaseoAgentKeyAuthHint {
   kind: "api_key";
-  envVar?: string;
+  envVar: string;
   keyUrl?: string;
   placeholder?: string;
   hint?: string;
@@ -30,6 +30,7 @@ export const PASEO_AGENT_PROVIDER_CATALOG = [
     id: "openrouter",
     piProvider: "openrouter",
     label: "OpenRouter",
+    auth: { kind: "api_key", envVar: "OPENROUTER_API_KEY" },
     defaultModels: false,
   },
   {

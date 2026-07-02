@@ -1,4 +1,4 @@
-import { findEnvKeys, getModels, type Api, type Model } from "@earendil-works/pi-ai";
+import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
 import { getOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import type { PaseoAgentCatalogEntry as PaseoAgentCatalogManifestEntry } from "@getpaseo/protocol/messages";
 import { z } from "zod";
@@ -123,10 +123,7 @@ export function resolvePaseoAgentCatalogAuth(
     return { kind: "oauth", flow: catalogEntry.piProvider };
   }
 
-  const envVar =
-    catalogEntry.auth?.kind === "api_key"
-      ? catalogEntry.auth.envVar
-      : findEnvKeys(catalogEntry.piProvider)?.[0];
+  const envVar = catalogEntry.auth?.kind === "api_key" ? catalogEntry.auth.envVar : undefined;
   if (!envVar) {
     throw new Error(`Paseo Agent provider "${catalogEntry.id}" has no auth source.`);
   }

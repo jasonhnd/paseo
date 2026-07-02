@@ -8,12 +8,54 @@ import {
   paseoAgentHasUsableModel,
   paseoAgentModelProviders,
   parsePaseoAgentModelId,
+  resolvePaseoAgentCatalogAuth,
   resolvePaseoAgentModel,
   type PaseoAgentConfig,
 } from "./config.js";
+import { PASEO_AGENT_PROVIDER_CATALOG } from "./catalog.js";
+
+const CATALOG_AUTH_ENV_VARS = [
+  ...new Set([
+    "OPENROUTER_API_KEY",
+    "KIMI_API_KEY",
+    "OPENCODE_API_KEY",
+    ...PASEO_AGENT_PROVIDER_CATALOG.flatMap((entry) =>
+      entry.auth?.kind === "api_key" ? [entry.auth.envVar] : [],
+    ),
+  ]),
+];
 
 function piModelIds(provider: Parameters<typeof getModels>[0]): string[] {
   return getModels(provider).map((model) => model.id);
+}
+
+function deleteEnvVars(names: readonly string[]): Map<string, string | undefined> {
+  const previousValues = new Map<string, string | undefined>();
+  for (const name of names) {
+    previousValues.set(name, process.env[name]);
+    delete process.env[name];
+  }
+
+  return previousValues;
+}
+
+function restoreEnvVars(previousValues: ReadonlyMap<string, string | undefined>): void {
+  for (const [name, value] of previousValues) {
+    if (value === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = value;
+    }
+  }
+}
+
+function resolveCatalogAuthEntries(): Array<
+  [string, ReturnType<typeof resolvePaseoAgentCatalogAuth>]
+> {
+  return PASEO_AGENT_PROVIDER_CATALOG.map((entry) => [
+    entry.id,
+    resolvePaseoAgentCatalogAuth(entry),
+  ]);
 }
 
 function configWith(overrides?: Partial<PaseoAgentConfig>): PaseoAgentConfig {
@@ -95,6 +137,22 @@ describe("model id encoding", () => {
 
   it("returns null for an unprefixed id", () => {
     expect(parsePaseoAgentModelId("noslash")).toBeNull();
+  });
+});
+
+describe("resolvePaseoAgentCatalogAuth", () => {
+  it("resolves every catalog entry without provider key env vars", () => {
+    const previousValues = deleteEnvVars(CATALOG_AUTH_ENV_VARS);
+    try {
+      expect(resolveCatalogAuthEntries()).toEqual([
+        ["openrouter", { kind: "api_key", envVar: "OPENROUTER_API_KEY" }],
+        ["chatgpt", { kind: "oauth", flow: "openai-codex" }],
+        ["kimi", { kind: "api_key", envVar: "KIMI_API_KEY" }],
+        ["opencode-go", { kind: "api_key", envVar: "OPENCODE_API_KEY" }],
+      ]);
+    } finally {
+      restoreEnvVars(previousValues);
+    }
   });
 });
 

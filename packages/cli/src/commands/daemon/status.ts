@@ -28,6 +28,7 @@ interface DaemonStatus {
   owner: string | null;
   logPath: string;
   daemonNode: string;
+  daemonExecutablePath: string | null;
   cliNode: string;
   cliVersion: string;
   daemonVersion: string | null;
@@ -126,6 +127,7 @@ function toStatusRows(status: DaemonStatus): StatusRow[] {
     { key: "Owner", value: status.owner ?? "-" },
     { key: "Logs", value: status.logPath },
     { key: "Daemon Node", value: status.daemonNode },
+    { key: "Daemon Executable", value: status.daemonExecutablePath ?? "-" },
     { key: "CLI Node", value: status.cliNode },
     { key: "CLI", value: status.cliVersion },
     { key: "Daemon Version", value: status.daemonVersion ?? "-" },
@@ -405,9 +407,11 @@ export async function runStatusCommand(
     owner,
     logPath: state.logPath,
     daemonNode,
+    daemonExecutablePath: state.pidInfo?.executablePath ?? null,
     cliNode,
     cliVersion,
     daemonVersion,
+    // COMPAT(desktopManagedPidLock): added in v0.1.105, remove after 2027-01-06 once locks without executablePath have aged out.
     desktopManaged: state.pidInfo?.desktopManaged === true,
     providers,
     note,

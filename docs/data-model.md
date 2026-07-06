@@ -37,6 +37,30 @@ The `agents/{sanitized-cwd}/` directory name is derived from the agent's `cwd` b
 
 ---
 
+## Runtime PID Lock
+
+**Path:** `$PASEO_HOME/paseo.pid`
+
+The daemon writes this file when it starts and removes it when it exits cleanly.
+It is a runtime lock, not a durable settings file.
+
+| Field            | Type                  | Description                                                                                                  |
+| ---------------- | --------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `pid`            | `number`              | Owner process PID for stop/status operations                                                                 |
+| `startedAt`      | `string` (ISO 8601)   | Lock creation timestamp                                                                                      |
+| `hostname`       | `string`              | Host that created the lock                                                                                   |
+| `uid`            | `number`              | User id that created the lock, or `0` where unavailable                                                      |
+| `listen`         | `string \| null`      | Daemon listen target at lock creation; updated when the server binds                                         |
+| `executablePath` | `string?`             | `process.execPath` for the daemon runtime. Desktop uses this to derive whether the daemon is desktop-managed |
+| `desktopManaged` | `boolean?` _(legacy)_ | Legacy spawn-origin flag accepted for old locks only; new locks derive desktop management from executable    |
+
+Desktop-managed is a read-time classification by the desktop app: the daemon
+executable must be the desktop app executable or live inside the same desktop
+install. The CLI reports the raw `executablePath` but does not try to classify
+it because an npm-installed CLI has no authoritative desktop install root.
+
+---
+
 ## 1. Agent Record
 
 **Path:** `$PASEO_HOME/agents/{project-dir}/{agentId}.json`

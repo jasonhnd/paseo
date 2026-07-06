@@ -6,6 +6,29 @@ import { describe, expect, test } from "vitest";
 import { acquirePidLock, getPidLockInfo, releasePidLock, updatePidLock } from "./pid-lock.js";
 
 describe("pid-lock ownership", () => {
+  test("records executable identity without writing desktop management intent", async () => {
+    const paseoHome = await mkdtemp(join(tmpdir(), "paseo-pid-lock-exec-"));
+    const previousDesktopManaged = process.env.PASEO_DESKTOP_MANAGED;
+
+    try {
+      process.env.PASEO_DESKTOP_MANAGED = "1";
+
+      await acquirePidLock(paseoHome, null, { ownerPid: process.pid });
+
+      const lock = await getPidLockInfo(paseoHome);
+      expect(lock?.executablePath).toBe(process.execPath);
+      expect(lock?.desktopManaged).toBeUndefined();
+    } finally {
+      if (previousDesktopManaged === undefined) {
+        delete process.env.PASEO_DESKTOP_MANAGED;
+      } else {
+        process.env.PASEO_DESKTOP_MANAGED = previousDesktopManaged;
+      }
+      await releasePidLock(paseoHome, { ownerPid: process.pid });
+      await rm(paseoHome, { recursive: true, force: true });
+    }
+  });
+
   test("writes and releases lock for explicit owner pid", async () => {
     const paseoHome = await mkdtemp(join(tmpdir(), "paseo-pid-lock-owner-"));
     const ownerPid = process.pid + 10_000;
@@ -22,6 +45,7 @@ describe("pid-lock ownership", () => {
       const lock = await getPidLockInfo(paseoHome);
       expect(lock?.pid).toBe(ownerPid);
       expect(lock?.listen).toBeNull();
+      expect(lock?.executablePath).toBe(process.execPath);
 
       await (
         updatePidLock as unknown as (

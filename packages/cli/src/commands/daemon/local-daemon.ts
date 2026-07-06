@@ -25,6 +25,7 @@ export interface LocalDaemonPidInfo {
   hostname?: string;
   uid?: number;
   listen?: string;
+  executablePath?: string;
   desktopManaged?: boolean;
 }
 
@@ -255,6 +256,7 @@ function readPidFile(pidPath: string): LocalDaemonPidInfo | null {
       hostname: typeof parsed.hostname === "string" ? parsed.hostname : undefined,
       uid: typeof parsed.uid === "number" ? parsed.uid : undefined,
       listen: resolveListenField(parsed.listen, parsed.sockPath),
+      executablePath: typeof parsed.executablePath === "string" ? parsed.executablePath : undefined,
       desktopManaged: parsed.desktopManaged === true ? true : undefined,
     };
   } catch {

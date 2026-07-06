@@ -10,6 +10,8 @@ export const pidLockInfoSchema = z.object({
   hostname: z.string(),
   uid: z.number(),
   listen: z.string().nullable(),
+  executablePath: z.string().optional(),
+  // COMPAT(desktopManagedPidLock): added in v0.1.105, remove after 2027-01-06 once locks without executablePath have aged out.
   desktopManaged: z.boolean().optional(),
 });
 
@@ -99,7 +101,7 @@ export async function acquirePidLock(
     hostname: hostname(),
     uid: process.getuid?.() ?? 0,
     listen,
-    ...(process.env.PASEO_DESKTOP_MANAGED === "1" ? { desktopManaged: true } : {}),
+    executablePath: process.execPath,
   };
 
   let fd;

@@ -7,6 +7,8 @@ import { createDaemonCommandHandlers } from "./daemon-manager";
 
 const mocks = vi.hoisted(() => ({
   paseoHome: "/tmp/paseo-desktop-daemon-manager-test-home",
+  desktopExecutablePath: "/opt/Paseo/Paseo",
+  managedDaemonExecutablePath: "/opt/Paseo/resources/Paseo",
   settings: {
     releaseChannel: "stable",
     daemon: {
@@ -23,7 +25,9 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("electron", () => ({
   app: {
-    getPath: vi.fn(() => "/tmp/paseo-user-data"),
+    getPath: vi.fn((name: string) =>
+      name === "exe" ? mocks.desktopExecutablePath : "/tmp/paseo-user-data",
+    ),
     getVersion: vi.fn(() => "1.2.3"),
     isPackaged: true,
   },
@@ -91,6 +95,30 @@ function createMockChildProcess(): MockChildProcess {
   return child;
 }
 
+function pidLockPath(): string {
+  return `${mocks.paseoHome}/paseo.pid`;
+}
+
+function writePidLock(input: {
+  pid: number;
+  executablePath?: string;
+  desktopManaged?: boolean;
+}): void {
+  mkdirSync(mocks.paseoHome, { recursive: true });
+  writeFileSync(pidLockPath(), JSON.stringify(input));
+}
+
+function writeManagedPidLock(pid: number): void {
+  writePidLock({
+    pid,
+    executablePath: mocks.managedDaemonExecutablePath,
+  });
+}
+
+function removePidLock(): void {
+  rmSync(pidLockPath(), { force: true });
+}
+
 function scheduleFailedStartup(child: MockChildProcess): void {
   setImmediate(() => {
     child.emit("exit", 1, null);
@@ -150,7 +178,54 @@ describe("daemon-manager commands", () => {
     expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledWith(["daemon", "status", "--json"]);
   });
 
+  it("derives desktop management from the pid lock executable path", async () => {
+    writeManagedPidLock(4242);
+    mocks.runExternalCliJsonCommand.mockResolvedValue({
+      localDaemon: "running",
+      connectedDaemon: "reachable",
+      serverId: "server-1",
+      pid: 4242,
+      listen: "127.0.0.1:6767",
+      daemonVersion: "1.2.3",
+      desktopManaged: false,
+    });
+    const handlers = createDaemonCommandHandlers();
+
+    await expect(handlers.desktop_daemon_status()).resolves.toEqual({
+      serverId: "server-1",
+      status: "running",
+      listen: "127.0.0.1:6767",
+      hostname: null,
+      pid: 4242,
+      home: mocks.paseoHome,
+      version: "1.2.3",
+      desktopManaged: true,
+      error: null,
+    });
+  });
+
+  it("falls back to the legacy desktopManaged lock field for old locks", async () => {
+    writePidLock({ pid: 4242, desktopManaged: true });
+    mocks.runExternalCliJsonCommand.mockResolvedValue({
+      localDaemon: "running",
+      connectedDaemon: "reachable",
+      serverId: "server-1",
+      pid: 4242,
+      listen: "127.0.0.1:6767",
+      daemonVersion: "1.2.3",
+      desktopManaged: false,
+    });
+    const handlers = createDaemonCommandHandlers();
+
+    await expect(handlers.desktop_daemon_status()).resolves.toMatchObject({
+      status: "running",
+      pid: 4242,
+      desktopManaged: true,
+    });
+  });
+
   it("routes running desktop daemon stops through external CLI daemon stop", async () => {
+    writeManagedPidLock(4242);
     mocks.runExternalCliJsonCommand
       .mockResolvedValueOnce({
         localDaemon: "running",
@@ -159,7 +234,10 @@ describe("daemon-manager commands", () => {
         listen: "127.0.0.1:6767",
         desktopManaged: true,
       })
-      .mockResolvedValueOnce({ action: "stopped" })
+      .mockImplementationOnce(async () => {
+        removePidLock();
+        return { action: "stopped" };
+      })
       .mockResolvedValueOnce({
         localDaemon: "stopped",
         serverId: "",
@@ -226,6 +304,7 @@ describe("daemon-manager commands", () => {
   });
 
   it("routes stale reachable desktop daemon stops through external CLI daemon stop", async () => {
+    writeManagedPidLock(7675);
     mocks.runExternalCliJsonCommand
       .mockResolvedValueOnce({
         localDaemon: "stale_pid",
@@ -236,7 +315,10 @@ describe("daemon-manager commands", () => {
         daemonVersion: "1.2.2",
         desktopManaged: true,
       })
-      .mockResolvedValueOnce({ action: "stopped" })
+      .mockImplementationOnce(async () => {
+        removePidLock();
+        return { action: "stopped" };
+      })
       .mockResolvedValueOnce({
         localDaemon: "stopped",
         connectedDaemon: "unreachable",
@@ -269,6 +351,7 @@ describe("daemon-manager commands", () => {
   });
 
   it("records the renderer stop reason when stopping the desktop daemon", async () => {
+    writeManagedPidLock(4242);
     mocks.runExternalCliJsonCommand
       .mockResolvedValueOnce({
         localDaemon: "running",
@@ -277,7 +360,10 @@ describe("daemon-manager commands", () => {
         listen: "127.0.0.1:6767",
         desktopManaged: true,
       })
-      .mockResolvedValueOnce({ action: "stopped", reason: "lifecycle_shutdown_rpc" })
+      .mockImplementationOnce(async () => {
+        removePidLock();
+        return { action: "stopped", reason: "lifecycle_shutdown_rpc" };
+      })
       .mockResolvedValueOnce({
         localDaemon: "stopped",
         serverId: "",
@@ -302,6 +388,7 @@ describe("daemon-manager commands", () => {
   });
 
   it("uses a stale reachable desktop daemon when the version matches", async () => {
+    writeManagedPidLock(7675);
     mocks.runExternalCliJsonCommand.mockResolvedValue({
       localDaemon: "stale_pid",
       connectedDaemon: "reachable",
@@ -330,6 +417,7 @@ describe("daemon-manager commands", () => {
   });
 
   it("restarts a stale reachable desktop daemon when the version differs", async () => {
+    writeManagedPidLock(7675);
     mocks.runExternalCliJsonCommand
       .mockResolvedValueOnce({
         localDaemon: "stale_pid",
@@ -350,21 +438,27 @@ describe("daemon-manager commands", () => {
         daemonVersion: "1.2.2",
         desktopManaged: true,
       })
-      .mockResolvedValueOnce({ action: "stopped" })
+      .mockImplementationOnce(async () => {
+        removePidLock();
+        return { action: "stopped" };
+      })
       .mockResolvedValueOnce({
         localDaemon: "stopped",
         connectedDaemon: "unreachable",
         serverId: "",
       })
-      .mockResolvedValueOnce({
-        localDaemon: "running",
-        connectedDaemon: "reachable",
-        serverId: "server-2",
-        pid: 8888,
-        listen: "127.0.0.1:6767",
-        hostname: "dev-host",
-        daemonVersion: "1.2.3",
-        desktopManaged: true,
+      .mockImplementationOnce(async () => {
+        writeManagedPidLock(8888);
+        return {
+          localDaemon: "running",
+          connectedDaemon: "reachable",
+          serverId: "server-2",
+          pid: 8888,
+          listen: "127.0.0.1:6767",
+          hostname: "dev-host",
+          daemonVersion: "1.2.3",
+          desktopManaged: true,
+        };
       });
     mocks.spawnProcess.mockReturnValue(createMockChildProcess());
     const handlers = createDaemonCommandHandlers();

@@ -39,6 +39,7 @@ import {
 import type { DesktopSettings } from "../settings/desktop-settings.js";
 import { getDesktopSettingsStore } from "../settings/desktop-settings-electron.js";
 import { isRunningUnderARM64Translation } from "../system/arm64-translation.js";
+import { deriveDesktopManagedFromExecutablePath } from "./desktop-managed.js";
 
 const DAEMON_LOG_FILENAME = "daemon.log";
 const STARTUP_POLL_INTERVAL_MS = 200;
@@ -123,11 +124,36 @@ function logFilePath(): string {
   return path.join(getPaseoHome(), DAEMON_LOG_FILENAME);
 }
 
+function deriveDesktopManagedFromPidLock(lock: Record<string, unknown>): boolean {
+  const executablePath = toTrimmedString(lock.executablePath);
+  if (executablePath) {
+    return deriveDesktopManagedFromExecutablePath({
+      daemonExecutablePath: executablePath,
+      desktopExecutablePath: app.getPath("exe"),
+      platform: process.platform,
+    });
+  }
+
+  // COMPAT(desktopManagedPidLock): added in v0.1.105, remove after 2027-01-06 once locks without executablePath have aged out.
+  return lock.desktopManaged === true;
+}
+
+function readDesktopManagedFromPidLock(): boolean {
+  try {
+    const raw = readFileSync(path.join(getPaseoHome(), "paseo.pid"), "utf-8");
+    const lock = JSON.parse(raw) as unknown;
+    return isRecord(lock) && deriveDesktopManagedFromPidLock(lock);
+  } catch {
+    return false;
+  }
+}
+
 export function isDesktopManagedDaemonRunningSync(): boolean {
   try {
     const raw = readFileSync(path.join(getPaseoHome(), "paseo.pid"), "utf-8");
-    const lock = JSON.parse(raw) as { pid?: unknown; desktopManaged?: unknown };
-    if (lock.desktopManaged !== true) return false;
+    const lock = JSON.parse(raw) as unknown;
+    if (!isRecord(lock)) return false;
+    if (!deriveDesktopManagedFromPidLock(lock)) return false;
     if (typeof lock.pid !== "number" || !Number.isInteger(lock.pid)) return false;
     return isProcessRunning(lock.pid);
   } catch {
@@ -276,7 +302,7 @@ export async function resolveDesktopDaemonStatus(): Promise<DesktopDaemonStatus>
       typeof payload.connectedDaemon === "string" ? payload.connectedDaemon : "not_probed";
     const hasRunningLocalProcess = localDaemon === "running";
     const hasLocalProcess = hasRunningLocalProcess || localDaemon === "unresponsive";
-    const desktopManaged = payload.desktopManaged === true;
+    const desktopManaged = readDesktopManagedFromPidLock();
     const apiReachable = connectedDaemon === "reachable";
     let status: DesktopDaemonState = "stopped";
     if (apiReachable || hasRunningLocalProcess) {
@@ -418,7 +444,7 @@ async function startDaemon(): Promise<DesktopDaemonStatus> {
     detached: true,
     envMode: "internal",
     env: invocation.env,
-    envOverlay: { PASEO_DESKTOP_MANAGED: "1", PASEO_WEB_UI_ENABLED: "false" },
+    envOverlay: { PASEO_WEB_UI_ENABLED: "false" },
     stdio: ["ignore", "ignore", "ignore"],
   });
 

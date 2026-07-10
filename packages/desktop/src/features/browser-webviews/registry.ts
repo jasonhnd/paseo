@@ -26,6 +26,8 @@ export class PaseoBrowserWebviewRegistry {
       previousHostWebContentsId !== input.hostWebContentsId
     ) {
       this.deleteActiveBrowserReferences(input.browserId);
+    } else {
+      this.deleteActiveBrowserReferencesOutsideHost(input.browserId, input.hostWebContentsId);
     }
 
     this.browserIdsByWebContentsId.set(input.webContentsId, input.browserId);
@@ -105,11 +107,17 @@ export class PaseoBrowserWebviewRegistry {
       }
       return;
     }
-    if (this.hostWebContentsIdsByBrowserId.get(input.browserId) !== input.hostWebContentsId) {
+    const registeredHostWebContentsId = this.hostWebContentsIdsByBrowserId.get(input.browserId);
+    if (
+      registeredHostWebContentsId !== undefined &&
+      registeredHostWebContentsId !== input.hostWebContentsId
+    ) {
       return;
     }
 
-    this.workspaceIdsByBrowserId.set(input.browserId, input.workspaceId);
+    if (registeredHostWebContentsId !== undefined) {
+      this.workspaceIdsByBrowserId.set(input.browserId, input.workspaceId);
+    }
     const activeBrowserIdsByWorkspace =
       this.activeBrowserIdsByHostWindow.get(input.hostWebContentsId) ?? new Map<string, string>();
     activeBrowserIdsByWorkspace.delete(input.workspaceId);
@@ -146,6 +154,26 @@ export class PaseoBrowserWebviewRegistry {
       }
       if (activeBrowserIdsByWorkspace.size === 0) {
         this.activeBrowserIdsByHostWindow.delete(hostWebContentsId);
+      }
+    }
+  }
+
+  private deleteActiveBrowserReferencesOutsideHost(
+    browserId: string,
+    hostWebContentsId: number,
+  ): void {
+    for (const [activeHostWebContentsId, activeBrowserIdsByWorkspace] of this
+      .activeBrowserIdsByHostWindow) {
+      if (activeHostWebContentsId === hostWebContentsId) {
+        continue;
+      }
+      for (const [workspaceId, activeBrowserId] of activeBrowserIdsByWorkspace) {
+        if (activeBrowserId === browserId) {
+          activeBrowserIdsByWorkspace.delete(workspaceId);
+        }
+      }
+      if (activeBrowserIdsByWorkspace.size === 0) {
+        this.activeBrowserIdsByHostWindow.delete(activeHostWebContentsId);
       }
     }
   }

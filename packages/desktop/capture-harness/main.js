@@ -1169,7 +1169,7 @@ function automationFixtureUrl() {
         <script>
           window.fixtureLog = [];
           window.preventBrowserShortcut = false;
-          document.addEventListener("keydown", (event) => {
+          window.addEventListener("keydown", (event) => {
             if (
               (event.metaKey || event.ctrlKey) &&
               !event.altKey &&
@@ -1500,16 +1500,16 @@ function sendContainedEnter(guest) {
   });
 }
 
-function automationBrowserShortcut(guest) {
+function automationBrowserShortcut(guest, keyCode = "B") {
   const modifiers = [process.platform === "darwin" ? "meta" : "control"];
   guest.sendInputEvent({
     type: "keyDown",
-    keyCode: "B",
+    keyCode,
     modifiers,
   });
   guest.sendInputEvent({
     type: "keyUp",
-    keyCode: "B",
+    keyCode,
     modifiers,
   });
 }
@@ -1788,6 +1788,26 @@ async function verifyBrowserKeyboardIsolation({ guest, win, browserId, usesMeta,
   pass("automation production guest preload forwards one page-unhandled browser shortcut");
   checks.push({ group: "automation", check: "browser-shortcut-page-first-forward", pass: true });
 
+  automationBrowserShortcut(guest, "1");
+  await waitForBrowserShortcutInput(shortcutInputs, 2);
+  const expectedDigitShortcutInput = {
+    alt: false,
+    browserId,
+    code: "Digit1",
+    control: !usesMeta,
+    key: "1",
+    meta: usesMeta,
+    repeat: false,
+    shift: false,
+  };
+  if (!isDeepStrictEqual(shortcutInputs[1], expectedDigitShortcutInput)) {
+    fail(
+      `digit browser shortcut crossed boundary incorrectly: inputs=${JSON.stringify(shortcutInputs)}`,
+    );
+  }
+  pass("automation production guest preload forwards digit wildcard shortcuts");
+  checks.push({ group: "automation", check: "browser-shortcut-digit-wildcard", pass: true });
+
   const focusedGuestInput = await guest.executeJavaScript(
     "document.getElementById('name').focus(); document.activeElement.id",
     true,
@@ -1826,6 +1846,30 @@ async function verifyBrowserKeyboardIsolation({ guest, win, browserId, usesMeta,
   }
   pass("automation guest Enter does not reach the active host composer");
   checks.push({ group: "automation", check: "guest-enter-host-isolation", pass: true });
+
+  win.hide();
+  await delay(50);
+  if (win.isFocused()) {
+    fail("automation harness window stayed focused after hide");
+  }
+  await guest.executeJavaScript("document.getElementById('name').focus()", true);
+  sendContainedEnter(guest);
+  await waitForAutomationLog(
+    guest,
+    (entry) => entry.event === "keydown-name" && entry.key === "Enter" && entry.trusted === true,
+    "trusted background guest Enter",
+  );
+  const hiddenHostComposerState = await win.webContents.executeJavaScript(
+    "window.captureHarness.hostComposerState()",
+    true,
+  );
+  if (!isDeepStrictEqual(hiddenHostComposerState, expectedHostComposerState)) {
+    fail(
+      `automation background guest Enter reached host composer: ${JSON.stringify(hiddenHostComposerState)}`,
+    );
+  }
+  pass("automation background guest Enter stays in the guest");
+  checks.push({ group: "automation", check: "background-guest-enter", pass: true });
 
   return checks;
 }
@@ -1882,6 +1926,14 @@ async function runAutomationGroup() {
           code: "KeyB",
           control: !usesMeta,
           key: "b",
+          meta: usesMeta,
+          repeat: false,
+          shift: false,
+        },
+        {
+          alt: false,
+          code: "Digit",
+          control: !usesMeta,
           meta: usesMeta,
           repeat: false,
           shift: false,

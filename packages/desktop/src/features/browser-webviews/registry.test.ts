@@ -114,7 +114,7 @@ describe("PaseoBrowserWebviewRegistry", () => {
     expect(registry.getActiveBrowserIdForHostWindow(202)).toBe("browser-second-window");
   });
 
-  it("clears a stale active reference when a browser moves to another host window", () => {
+  it("keeps same-browser active references in separate host windows", () => {
     const registry = new PaseoBrowserWebviewRegistry();
 
     registry.registerWebContents({
@@ -132,8 +132,47 @@ describe("PaseoBrowserWebviewRegistry", () => {
       browserId: "browser-a",
       hostWebContentsId: 202,
     });
+    registry.setWorkspaceActiveBrowser({
+      hostWebContentsId: 202,
+      workspaceId: "workspace-a",
+      browserId: "browser-a",
+    });
+
+    expect(registry.getActiveBrowserIdForHostWindow(101)).toBe("browser-a");
+    expect(registry.getActiveBrowserIdForHostWindow(202)).toBe("browser-a");
+    expect(registry.getWebContentsIdForBrowserInHostWindow(101, "browser-a")).toBe(11);
+    expect(registry.getWebContentsIdForBrowserInHostWindow(202, "browser-a")).toBe(22);
+  });
+
+  it("keeps another host's active browser when one guest is destroyed", () => {
+    const registry = new PaseoBrowserWebviewRegistry();
+
+    registry.registerWebContents({
+      webContentsId: 11,
+      browserId: "browser-a",
+      hostWebContentsId: 101,
+    });
+    registry.registerWebContents({
+      webContentsId: 22,
+      browserId: "browser-a",
+      hostWebContentsId: 202,
+    });
+    registry.setWorkspaceActiveBrowser({
+      hostWebContentsId: 101,
+      workspaceId: "workspace-a",
+      browserId: "browser-a",
+    });
+    registry.setWorkspaceActiveBrowser({
+      hostWebContentsId: 202,
+      workspaceId: "workspace-a",
+      browserId: "browser-a",
+    });
+
+    registry.unregisterWebContents(11);
 
     expect(registry.getActiveBrowserIdForHostWindow(101)).toBeNull();
+    expect(registry.getActiveBrowserIdForHostWindow(202)).toBe("browser-a");
+    expect(registry.getWebContentsIdForBrowserInHostWindow(202, "browser-a")).toBe(22);
   });
 
   it("keeps the same-window active selection made before the guest attaches", () => {
@@ -153,7 +192,7 @@ describe("PaseoBrowserWebviewRegistry", () => {
     expect(registry.getActiveBrowserIdForHostWindow(101)).toBe("browser-a");
   });
 
-  it("drops a pre-attach selection when the guest attaches to another host window", () => {
+  it("keeps a pre-attach selection when another host attaches the same browser", () => {
     const registry = new PaseoBrowserWebviewRegistry();
 
     registry.setWorkspaceActiveBrowser({
@@ -167,7 +206,7 @@ describe("PaseoBrowserWebviewRegistry", () => {
       hostWebContentsId: 202,
     });
 
-    expect(registry.getActiveBrowserIdForHostWindow(101)).toBeNull();
+    expect(registry.getActiveBrowserIdForHostWindow(101)).toBe("browser-a");
     expect(registry.getActiveBrowserIdForHostWindow(202)).toBeNull();
   });
 });

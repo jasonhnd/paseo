@@ -124,7 +124,22 @@ export function getActivePaseoBrowserWebContentsForHostWindow(
   hostWebContentsId: number,
 ): WebContents | null {
   const browserId = browserRegistry.getActiveBrowserIdForHostWindow(hostWebContentsId);
-  return browserId ? getPaseoBrowserWebContents(browserId) : null;
+  if (!browserId) {
+    return null;
+  }
+  const contentsId = browserRegistry.getWebContentsIdForBrowserInHostWindow(
+    hostWebContentsId,
+    browserId,
+  );
+  if (contentsId === null) {
+    return null;
+  }
+  const contents = allWebContents.fromId(contentsId);
+  if (contents && !contents.isDestroyed()) {
+    return contents;
+  }
+  browserRegistry.unregisterWebContents(contentsId);
+  return null;
 }
 
 function preventUnsafeBrowserWebviewNavigation(

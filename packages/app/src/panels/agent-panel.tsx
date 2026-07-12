@@ -908,7 +908,7 @@ function ChatAgentContent({
       }
       return;
     }
-    if (!isConnected || !hasSession) {
+    if (!isPaneFocused || !isConnected || !hasSession) {
       return;
     }
     if (
@@ -969,6 +969,7 @@ function ChatAgentContent({
     ensureAgentIsInitialized,
     hasSession,
     isConnected,
+    isPaneFocused,
     missingAgentState.kind,
     serverId,
   ]);

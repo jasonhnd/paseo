@@ -30,7 +30,7 @@ import type {
 
 const COALESCE_WINDOW_MS = AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS;
 const BEFORE_COALESCE_WINDOW_MS = Math.max(COALESCE_WINDOW_MS - 1, 0);
-const TOOL_CALL_CONTENT_MAX_LENGTH = 64 * 1024;
+const TOOL_CALL_CONTENT_MAX_BYTES = 64 * 1024;
 
 const TEST_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
@@ -385,7 +385,7 @@ describe("target coalesced behavior", () => {
       const output = `${"a".repeat(512 * 1024)}${"z".repeat(512 * 1024)}`;
       const expectedItem = toolCall({
         status: "completed",
-        output: "a".repeat(TOOL_CALL_CONTENT_MAX_LENGTH),
+        output: "a".repeat(TOOL_CALL_CONTENT_MAX_BYTES),
       });
 
       session.pushEvent(timelineEvent(toolCall({ status: "completed", output })));
@@ -403,6 +403,27 @@ describe("target coalesced behavior", () => {
     }
   });
 
+  test("bounds tool output by UTF-8 bytes", async () => {
+    const harness = createHarness();
+    try {
+      const { agentId, session } = await createManagedSession(harness);
+      const output = "漢".repeat(TOOL_CALL_CONTENT_MAX_BYTES);
+      const expectedItem = toolCall({
+        status: "completed",
+        output: "漢".repeat(Math.floor(TOOL_CALL_CONTENT_MAX_BYTES / 3)),
+      });
+
+      session.pushEvent(timelineEvent(toolCall({ status: "completed", output })));
+      await waitForSessionEventQueue();
+
+      expect(getTimelineItems(await harness.manager.getTimelineRows(agentId))).toEqual([
+        expectedItem,
+      ]);
+    } finally {
+      harness.cleanup();
+    }
+  });
+
   test("bounds appended tool output before persisting and streaming it", async () => {
     const harness = createHarness();
     try {
@@ -410,7 +431,7 @@ describe("target coalesced behavior", () => {
       const output = `${"a".repeat(512 * 1024)}${"z".repeat(512 * 1024)}`;
       const expectedItem = toolCall({
         status: "completed",
-        output: "a".repeat(TOOL_CALL_CONTENT_MAX_LENGTH),
+        output: "a".repeat(TOOL_CALL_CONTENT_MAX_BYTES),
       });
 
       await harness.manager.appendTimelineItem(agentId, toolCall({ status: "completed", output }));
@@ -434,7 +455,7 @@ describe("target coalesced behavior", () => {
       const output = `${"a".repeat(512 * 1024)}${"z".repeat(512 * 1024)}`;
       const expectedItem = toolCall({
         status: "completed",
-        output: "a".repeat(TOOL_CALL_CONTENT_MAX_LENGTH),
+        output: "a".repeat(TOOL_CALL_CONTENT_MAX_BYTES),
       });
       session.setHistory([timelineEvent(toolCall({ status: "completed", output }))]);
 
@@ -455,7 +476,7 @@ describe("target coalesced behavior", () => {
       const output = `${"a".repeat(512 * 1024)}${"z".repeat(512 * 1024)}`;
       const expectedItem = toolCall({
         status: "completed",
-        output: "a".repeat(TOOL_CALL_CONTENT_MAX_LENGTH),
+        output: "a".repeat(TOOL_CALL_CONTENT_MAX_BYTES),
       });
 
       await harness.manager.emitLiveTimelineItem(
@@ -473,17 +494,22 @@ describe("target coalesced behavior", () => {
     }
   });
 
-  test("bounds failed shell output carried in the error", async () => {
+  test("bounds failed shell output carried in error content and message", async () => {
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
       const content = `${"a".repeat(512 * 1024)}${"z".repeat(512 * 1024)}`;
       const expectedItem = toolCall({
         status: "failed",
-        error: { content: "a".repeat(TOOL_CALL_CONTENT_MAX_LENGTH) },
+        error: {
+          content: "a".repeat(TOOL_CALL_CONTENT_MAX_BYTES),
+          message: "a".repeat(TOOL_CALL_CONTENT_MAX_BYTES),
+        },
       });
 
-      session.pushEvent(timelineEvent(toolCall({ status: "failed", error: { content } })));
+      session.pushEvent(
+        timelineEvent(toolCall({ status: "failed", error: { content, message: content } })),
+      );
       await waitForSessionEventQueue();
 
       expect(getTimelineItems(await harness.manager.getTimelineRows(agentId))).toEqual([

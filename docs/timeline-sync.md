@@ -9,10 +9,10 @@ The invariant is:
 
 > If the daemon has committed timeline rows for an agent, any connected client that opens or resumes that agent eventually displays every row through the daemon's current tail.
 
-Tool output is bounded before it enters either delivery path. Canonical shell tool output is sliced
-to 64 KiB, and the same bounded item is used for durable timeline rows and live stream events.
-Provider history hydration applies the same rule so reopening an agent cannot restore an oversized
-tool payload.
+Tool output is bounded before it enters either delivery path. Canonical shell tool output and failed
+shell error text are capped at 64 KiB of UTF-8 data, and the same bounded item is used for durable
+timeline rows and live stream events. Provider history hydration applies the same rule so reopening
+an agent cannot restore an oversized tool payload.
 
 ## Presence is not delivery
 

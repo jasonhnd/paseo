@@ -593,7 +593,10 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
           isCurrent: () => workspaceHydrationRef.current?.id === transaction.id,
         });
       } catch (error) {
-        if (workspaceHydrationRef.current === transaction) workspaceHydrationRef.current = null;
+        if (workspaceHydrationRef.current === transaction) {
+          workspaceHydrationRef.current = null;
+          for (const delta of transaction.deltas) applyWorkspaceUpdatePayload(delta);
+        }
         throw error;
       }
       if (!snapshot || options?.isCancelled?.()) {

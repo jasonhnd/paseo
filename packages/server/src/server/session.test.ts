@@ -6,6 +6,7 @@ import pino from "pino";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import type { WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
 import {
   decodeFileTransferFrame,
@@ -4247,6 +4248,8 @@ test("unions viewed timelines across socket sources and removes detached sources
 
   const legacySocket = {};
   session.updateClientCapabilities(null, legacySocket);
+  expect(session.supportsForSource(CLIENT_CAPS.selectiveAgentTimeline, legacySocket)).toBe(false);
+  expect(session.supportsForSource(CLIENT_CAPS.selectiveAgentTimeline, firstSocket)).toBe(true);
   messages.length = 0;
   forward({
     type: "agent_stream",

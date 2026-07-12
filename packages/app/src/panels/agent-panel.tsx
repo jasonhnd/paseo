@@ -911,7 +911,11 @@ function ChatAgentContent({
     if (!isConnected || !hasSession) {
       return;
     }
-    if (missingAgentState.kind === "resolving" || missingAgentState.kind === "not_found") {
+    if (
+      missingAgentState.kind === "resolving" ||
+      missingAgentState.kind === "not_found" ||
+      missingAgentState.kind === "error"
+    ) {
       return;
     }
 

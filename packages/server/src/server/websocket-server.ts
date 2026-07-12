@@ -1102,6 +1102,7 @@ export class VoiceAssistantWebSocketServer {
       sockets: new Set([ws]),
       externalDisconnectCleanupTimeout: null,
     };
+    session.updateClientCapabilities(clientCapabilities, ws);
     return connection;
   }
 
@@ -1175,7 +1176,7 @@ export class VoiceAssistantWebSocketServer {
       // COMPAT(selectiveAgentTimeline): added in v0.1.106. Every capable resumed
       // hello resets membership before server_info so stale retained-session
       // state cannot leak. Remove after 2027-01-12.
-      existing.session.updateClientCapabilities(newClientCapabilities);
+      existing.session.updateClientCapabilities(newClientCapabilities, ws);
       if (
         JSON.stringify(existing.clientCapabilities ?? null) !==
         JSON.stringify(newClientCapabilities ?? null)

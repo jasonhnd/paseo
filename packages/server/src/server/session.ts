@@ -560,6 +560,7 @@ export class Session {
   private unsubscribeAgentEvents: (() => void) | null = null;
   private viewedTimelineAgentIds = new Set<string>();
   private readonly viewedTimelineAgentIdsBySource = new Map<object, Set<string>>();
+  private readonly selectiveTimelineCapabilityBySource = new Map<object, boolean>();
   private readonly defaultTimelineSubscriptionSource = {};
   private unsubscribeTerminalWorkspaceContributionEvents: (() => void) | null = null;
   private readonly agentUpdates: AgentUpdatesService;
@@ -930,17 +931,25 @@ export class Session {
     }
   }
 
-  updateClientCapabilities(capabilities: Record<string, unknown> | null): void {
+  updateClientCapabilities(capabilities: Record<string, unknown> | null, source?: object): void {
     this.clientCapabilities = parseClientCapabilities(capabilities);
-    if (!this.supports(CLIENT_CAPS.selectiveAgentTimeline)) {
+    if (source) {
+      this.selectiveTimelineCapabilityBySource.set(
+        source,
+        this.supports(CLIENT_CAPS.selectiveAgentTimeline),
+      );
+    }
+    if (!source && !this.supports(CLIENT_CAPS.selectiveAgentTimeline)) {
       this.viewedTimelineAgentIdsBySource.clear();
       this.viewedTimelineAgentIds.clear();
     }
   }
 
   clearAgentTimelineSubscription(source: object): void {
-    if (!this.viewedTimelineAgentIdsBySource.delete(source)) return;
-    this.rebuildViewedTimelineAgentIds();
+    this.selectiveTimelineCapabilityBySource.delete(source);
+    if (this.viewedTimelineAgentIdsBySource.delete(source)) {
+      this.rebuildViewedTimelineAgentIds();
+    }
   }
 
   private replaceAgentTimelineSubscription(source: object | undefined, agentIds: string[]): void {
@@ -956,6 +965,16 @@ export class Session {
       for (const agentId of agentIds) viewedAgentIds.add(agentId);
     }
     this.viewedTimelineAgentIds = viewedAgentIds;
+  }
+
+  private usesSelectiveTimelineDelivery(): boolean {
+    if (this.selectiveTimelineCapabilityBySource.size === 0) {
+      return this.supports(CLIENT_CAPS.selectiveAgentTimeline);
+    }
+    for (const capable of this.selectiveTimelineCapabilityBySource.values()) {
+      if (!capable) return false;
+    }
+    return true;
   }
 
   supports(capability: ClientCapability): boolean {
@@ -1277,10 +1296,7 @@ export class Session {
           "agent.session.forward_stream",
         );
 
-        if (
-          this.supports(CLIENT_CAPS.selectiveAgentTimeline) &&
-          serializedEvent.type === "attention_required"
-        ) {
+        if (this.usesSelectiveTimelineDelivery() && serializedEvent.type === "attention_required") {
           this.emit({
             type: "agent_attention_required",
             payload: {
@@ -1294,7 +1310,7 @@ export class Session {
             },
           });
         } else if (
-          !this.supports(CLIENT_CAPS.selectiveAgentTimeline) ||
+          !this.usesSelectiveTimelineDelivery() ||
           this.viewedTimelineAgentIds.has(event.agentId)
         ) {
           this.emit({
@@ -1554,7 +1570,12 @@ export class Session {
         return this.handleProviderSubagentTimelineRequest(msg);
       case "agent.timeline.set_subscription.request": {
         const agentIds = [...new Set(msg.agentIds)].sort();
-        if (this.supports(CLIENT_CAPS.selectiveAgentTimeline)) {
+        if (
+          source
+            ? (this.selectiveTimelineCapabilityBySource.get(source) ??
+              this.supports(CLIENT_CAPS.selectiveAgentTimeline))
+            : this.supports(CLIENT_CAPS.selectiveAgentTimeline)
+        ) {
           this.replaceAgentTimelineSubscription(source, agentIds);
         }
         this.emit({
@@ -4398,6 +4419,7 @@ export class Session {
         "fetch_workspaces_response_ready",
       );
       const snapshot = this.buildBootstrapSnapshot(payload.entries);
+      this.seedWorkspaceSubscriptionSnapshot(subscriptionId, payload.entries);
 
       this.emit({
         type: "fetch_workspaces_response",
@@ -4456,6 +4478,20 @@ export class Session {
       });
     }
     return { snapshotByWorkspaceId };
+  }
+
+  private seedWorkspaceSubscriptionSnapshot(
+    subscriptionId: string | null,
+    entries: FetchWorkspacesResponseEntry[],
+  ): void {
+    const subscription = this.workspaceUpdatesSubscription;
+    if (!subscriptionId || subscription?.subscriptionId !== subscriptionId) return;
+    for (const entry of entries) {
+      subscription.lastEmittedByWorkspaceId.set(entry.id, {
+        kind: "upsert",
+        workspace: entry,
+      });
+    }
   }
 
   private async registerWorkspaceForImportedAgent(

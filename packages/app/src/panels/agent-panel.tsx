@@ -902,7 +902,7 @@ function ChatAgentContent({
     if (!agentId) {
       return;
     }
-    if (agentState.id) {
+    if (agentState.id && hasAppliedAuthoritativeHistory) {
       if (missingAgentState.kind === "resolving" || missingAgentState.kind === "not_found") {
         setMissingAgentState(reconcileMissingAgentStateWithPresentAgent);
       }
@@ -959,6 +959,7 @@ function ChatAgentContent({
       });
   }, [
     agentState.id,
+    hasAppliedAuthoritativeHistory,
     agentId,
     client,
     ensureAgentIsInitialized,

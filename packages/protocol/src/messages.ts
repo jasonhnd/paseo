@@ -1311,6 +1311,12 @@ export const ProviderSubagentTimelineRequestMessageSchema = z.object({
   limit: z.number().int().nonnegative().optional(),
 });
 
+export const SetAgentTimelineSubscriptionRequestMessageSchema = z.object({
+  type: z.literal("agent.timeline.set_subscription.request"),
+  agentIds: z.array(z.string()),
+  requestId: z.string(),
+});
+
 export const AgentForkContextRequestMessageSchema = z.object({
   type: z.literal("agent.fork_context.request"),
   agentId: z.string(),
@@ -2117,6 +2123,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   FetchAgentTimelineRequestMessageSchema,
   ProviderSubagentListRequestMessageSchema,
   ProviderSubagentTimelineRequestMessageSchema,
+  SetAgentTimelineSubscriptionRequestMessageSchema,
   AgentForkContextRequestMessageSchema,
   SetAgentModeRequestMessageSchema,
   SetAgentModelRequestMessageSchema,
@@ -2397,6 +2404,8 @@ export const ServerInfoStatusPayloadSchema = z
         agentForkContext: z.boolean().optional(),
         // COMPAT(providerSubagents): added in v0.1.107, remove gate after 2027-01-12.
         providerSubagents: z.boolean().optional(),
+        // COMPAT(selectiveAgentTimeline): added in v0.1.106, remove after 2027-01-12.
+        selectiveAgentTimeline: z.boolean().optional(),
       })
       .optional(),
   })
@@ -3068,6 +3077,35 @@ export const ProviderSubagentUpdateMessageSchema = z.object({
       subagentId: z.string(),
     }),
   ]),
+});
+
+export const SetAgentTimelineSubscriptionResponseMessageSchema = z.object({
+  type: z.literal("agent.timeline.set_subscription.response"),
+  payload: z.object({
+    agentIds: z.array(z.string()),
+    requestId: z.string(),
+  }),
+});
+
+export const AgentAttentionRequiredMessageSchema = z.object({
+  type: z.literal("agent_attention_required"),
+  payload: z.object({
+    agentId: z.string(),
+    reason: z.enum(["finished", "error", "permission"]),
+    timestamp: z.string(),
+    shouldNotify: z.boolean(),
+    notification: z
+      .object({
+        title: z.string(),
+        body: z.string(),
+        data: z.object({
+          serverId: z.string(),
+          agentId: z.string(),
+          reason: z.enum(["finished", "error", "permission"]),
+        }),
+      })
+      .optional(),
+  }),
 });
 
 export const AgentForkContextResponseMessageSchema = z.object({
@@ -4322,6 +4360,8 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ProviderSubagentListResponseMessageSchema,
   ProviderSubagentTimelineResponseMessageSchema,
   ProviderSubagentUpdateMessageSchema,
+  SetAgentTimelineSubscriptionResponseMessageSchema,
+  AgentAttentionRequiredMessageSchema,
   AgentForkContextResponseMessageSchema,
   CancelAgentResponseMessageSchema,
   ClearAgentAttentionResponseMessageSchema,
@@ -4792,6 +4832,7 @@ export const WSHelloMessageSchema = z.object({
       voice: z.boolean().optional(),
       pushNotifications: z.boolean().optional(),
       [CLIENT_CAPS.reasoningMergeEnum]: z.boolean().optional(),
+      [CLIENT_CAPS.selectiveAgentTimeline]: z.boolean().optional(),
       [CLIENT_CAPS.customModeIcons]: z.boolean().optional(),
       [CLIENT_CAPS.terminalReflowableSnapshot]: z.boolean().optional(),
       [CLIENT_CAPS.providerSubagents]: z.boolean().optional(),

@@ -44,6 +44,7 @@ import {
 } from "./agent-sdk-types.js";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
 import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
+import type { AgentOwner } from "./agent-owner.js";
 import {
   InMemoryAgentTimelineStore,
   type SeedAgentTimelineOptions,
@@ -218,6 +219,7 @@ export interface CreateAgentOptions {
   initialTitle?: string | null;
   // undefined is an explicit decision: the agent never appears in the sidebar.
   workspaceId: string | undefined;
+  owner?: AgentOwner;
 }
 
 export interface AgentManagerOptions {
@@ -292,6 +294,7 @@ interface ManagedAgentBase {
    * Null/undefined for legacy agents created before ownership stamping.
    */
   workspaceId?: string;
+  owner?: AgentOwner;
   capabilities: AgentCapabilityFlags;
   config: AgentSessionConfig;
   runtimeInfo?: AgentRuntimeInfo;
@@ -993,6 +996,7 @@ export class AgentManager {
       labels: options.labels,
       initialTitle: options.initialTitle,
       workspaceId: options.workspaceId,
+      owner: options.owner,
     });
   }
 
@@ -1016,6 +1020,7 @@ export class AgentManager {
       lastUserMessageAt?: Date | null;
       labels?: Record<string, string>;
       workspaceId?: string;
+      owner?: AgentOwner;
     },
   ): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(
@@ -1033,6 +1038,7 @@ export class AgentManager {
       lastUserMessageAt?: Date | null;
       labels?: Record<string, string>;
       workspaceId?: string;
+      owner?: AgentOwner;
     },
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
@@ -1212,6 +1218,7 @@ export class AgentManager {
       return this.registerSession(session, storedConfig, agentId, {
         labels: existing.labels,
         workspaceId: existing.workspaceId,
+        owner: existing.owner,
         createdAt: existing.createdAt,
         updatedAt: existing.updatedAt,
         lastUserMessageAt: existing.lastUserMessageAt,
@@ -1281,7 +1288,7 @@ export class AgentManager {
     }
   }
 
-  async closeAgent(agentId: string): Promise<void> {
+  async closeAgent(agentId: string, options: { persistClosedState?: boolean } = {}): Promise<void> {
     const agent = this.requireAgent(agentId);
     this.logger.trace(
       {
@@ -1301,7 +1308,9 @@ export class AgentManager {
     for (const event of this.providerSubagents.deleteParent(agentId)) {
       this.dispatch({ type: "provider_subagent", event });
     }
-    await this.persistSnapshot(closedAgent);
+    if (options.persistClosedState !== false) {
+      await this.persistSnapshot(closedAgent);
+    }
     this.emitClosedAgent(closedAgent, { persist: false });
     this.logger.trace(
       {
@@ -1403,6 +1412,7 @@ export class AgentManager {
         provider: record.provider,
         cwd: record.cwd,
         workspaceId: record.workspaceId,
+        owner: record.owner,
         session: null,
         capabilities: STORED_AGENT_CAPABILITIES,
         config: buildStoredAgentConfig(record),
@@ -2593,6 +2603,7 @@ export class AgentManager {
       initialTitle?: string | null;
       publishWhenReady?: boolean;
       workspaceId?: string;
+      owner?: AgentOwner;
     },
   ): Promise<ManagedAgent> {
     let registered = false;
@@ -2728,6 +2739,7 @@ export class AgentManager {
           attention?: AttentionState;
           persistence?: AgentPersistenceHandle;
           workspaceId?: string;
+          owner?: AgentOwner;
         }
       | undefined;
   }): ActiveManagedAgent {
@@ -2737,6 +2749,7 @@ export class AgentManager {
       provider: config.provider,
       cwd: config.cwd,
       workspaceId: options?.workspaceId,
+      owner: options?.owner,
       session,
       capabilities: session.capabilities,
       config,

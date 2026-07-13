@@ -8,6 +8,7 @@ import { AgentFeatureSchema, AgentStatusSchema } from "../messages.js";
 import { toStoredAgentRecord } from "./agent-projections.js";
 import type { ManagedAgent } from "./agent-manager.js";
 import type { AgentSessionConfig } from "./agent-sdk-types.js";
+import { AgentOwnerSchema, hubExecutionKey, type HubAgentOwner } from "./agent-owner.js";
 
 const SERIALIZABLE_CONFIG_SCHEMA = z
   .object({
@@ -64,6 +65,7 @@ const STORED_AGENT_SCHEMA = z.object({
   attentionTimestamp: z.string().nullable().optional(),
   internal: z.boolean().optional(),
   archivedAt: z.string().nullable().optional(),
+  owner: AgentOwnerSchema.optional(),
 });
 
 export type SerializableAgentConfig = Pick<
@@ -88,6 +90,7 @@ export class AgentStorage {
   private pathsById: Map<string, Set<string>> = new Map();
   private pendingWrites: Map<string, Promise<void>> = new Map();
   private deleting: Set<string> = new Set();
+  private hubAgentIdsByExecution: Map<string, string> = new Map();
   private loaded = false;
   private baseDir: string;
   private loadPromise: Promise<StoredAgentRecord[]> | null = null;
@@ -110,6 +113,12 @@ export class AgentStorage {
   async get(agentId: string): Promise<StoredAgentRecord | null> {
     await this.load();
     return this.cache.get(agentId) ?? null;
+  }
+
+  async findByHubExecution(owner: HubAgentOwner): Promise<StoredAgentRecord | null> {
+    await this.load();
+    const agentId = this.hubAgentIdsByExecution.get(hubExecutionKey(owner));
+    return agentId ? (this.cache.get(agentId) ?? null) : null;
   }
 
   async upsert(record: StoredAgentRecord): Promise<void> {
@@ -157,6 +166,7 @@ export class AgentStorage {
     }
 
     this.cache.set(agentId, record);
+    this.indexOwner(record);
     this.pathById.set(agentId, nextPath);
   }
 
@@ -186,6 +196,7 @@ export class AgentStorage {
     );
 
     this.cache.delete(agentId);
+    this.removeOwnerIndex(agentId);
     this.pathById.delete(agentId);
     this.pathsById.delete(agentId);
   }
@@ -248,6 +259,7 @@ export class AgentStorage {
     this.cache.clear();
     this.pathById.clear();
     this.pathsById.clear();
+    this.hubAgentIdsByExecution.clear();
 
     try {
       const records = await this.scanDisk();
@@ -310,6 +322,7 @@ export class AgentStorage {
       const { record, filePath } = item;
       records.push(record);
       this.cache.set(record.id, record);
+      this.indexOwner(record);
       this.pathById.set(record.id, filePath);
       this.addIndexedPath(record.id, filePath);
     }
@@ -347,6 +360,21 @@ export class AgentStorage {
     paths.delete(filePath);
     if (paths.size === 0) {
       this.pathsById.delete(agentId);
+    }
+  }
+
+  private indexOwner(record: StoredAgentRecord): void {
+    this.removeOwnerIndex(record.id);
+    if (record.owner?.kind === "hub") {
+      this.hubAgentIdsByExecution.set(hubExecutionKey(record.owner), record.id);
+    }
+  }
+
+  private removeOwnerIndex(agentId: string): void {
+    for (const [key, indexedAgentId] of this.hubAgentIdsByExecution) {
+      if (indexedAgentId === agentId) {
+        this.hubAgentIdsByExecution.delete(key);
+      }
     }
   }
 

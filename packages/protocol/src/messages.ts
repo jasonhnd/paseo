@@ -1088,6 +1088,22 @@ export const DaemonGetPairingOfferRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const HubRelationshipConnectRequestSchema = z.object({
+  type: z.literal("hub.relationship.connect.request"),
+  requestId: z.string(),
+  hubUrl: z.string(),
+  token: z.string(),
+});
+export const HubRelationshipGetStatusRequestSchema = z.object({
+  type: z.literal("hub.relationship.get_status.request"),
+  requestId: z.string(),
+});
+export const HubRelationshipDisconnectRequestSchema = z.object({
+  type: z.literal("hub.relationship.disconnect.request"),
+  requestId: z.string(),
+  force: z.boolean().optional(),
+});
+
 export const DiagnosticsRequestSchema = z.object({
   type: z.literal("diagnostics.request"),
   requestId: z.string(),
@@ -2087,7 +2103,35 @@ export const CaptureTerminalRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const HubAgentCreateRequestSchema = z.object({
+  type: z.literal("hub.agent.create.request"),
+  requestId: z.string(),
+  executionId: z.string(),
+  provider: z.string(),
+  cwd: z.string(),
+  prompt: z.string(),
+  workspaceId: z.string().optional(),
+  model: z.string().optional(),
+  modeId: z.string().optional(),
+  thinkingOptionId: z.string().optional(),
+  featureValues: z.record(z.string(), z.unknown()).optional(),
+  env: z.record(z.string(), z.string()).optional(),
+  worktree: CreateAgentWorktreeTargetSchema.optional(),
+  autoArchive: z.boolean().optional(),
+});
+
+export const HubExecutionReconcileRequestSchema = z.object({
+  type: z.literal("hub.execution.reconcile.request"),
+  requestId: z.string(),
+  executionId: z.string(),
+});
+
+export type HubAgentCreateRequest = z.infer<typeof HubAgentCreateRequestSchema>;
+export type HubExecutionReconcileRequest = z.infer<typeof HubExecutionReconcileRequestSchema>;
+
 export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
+  HubAgentCreateRequestSchema,
+  HubExecutionReconcileRequestSchema,
   BrowserAutomationExecuteResponseSchema,
   VoiceAudioChunkMessageSchema,
   AbortRequestMessageSchema,
@@ -2110,6 +2154,9 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   WaitForFinishRequestSchema,
   DaemonGetStatusRequestSchema,
   DaemonGetPairingOfferRequestSchema,
+  HubRelationshipConnectRequestSchema,
+  HubRelationshipGetStatusRequestSchema,
+  HubRelationshipDisconnectRequestSchema,
   DiagnosticsRequestSchema,
   GetDaemonConfigRequestMessageSchema,
   SetDaemonConfigRequestMessageSchema,
@@ -3218,6 +3265,38 @@ export const DaemonGetStatusResponseSchema = z.object({
     .passthrough(),
 });
 
+export const HubRelationshipStatusSchema = z.object({
+  state: z.enum([
+    "not_connected",
+    "connecting",
+    "connected",
+    "reconnecting",
+    "disconnecting",
+    "revoked",
+  ]),
+  relationshipId: z.string().nullable(),
+  hubOrigin: z.string().nullable(),
+  scopes: z.array(z.string()),
+  connectedAt: z.string().nullable(),
+  lastError: z.string().nullable(),
+});
+export const HubRelationshipConnectResponseSchema = z.object({
+  type: z.literal("hub.relationship.connect.response"),
+  payload: z.object({ requestId: z.string(), status: HubRelationshipStatusSchema }),
+});
+export const HubRelationshipGetStatusResponseSchema = z.object({
+  type: z.literal("hub.relationship.get_status.response"),
+  payload: z.object({ requestId: z.string(), status: HubRelationshipStatusSchema }),
+});
+export const HubRelationshipDisconnectResponseSchema = z.object({
+  type: z.literal("hub.relationship.disconnect.response"),
+  payload: z.object({
+    requestId: z.string(),
+    status: HubRelationshipStatusSchema,
+    warning: z.string().optional(),
+  }),
+});
+
 export const DaemonGetPairingOfferResponseSchema = z.object({
   type: z.literal("daemon.get_pairing_offer.response"),
   payload: z
@@ -4307,9 +4386,101 @@ export const DaemonUpdateProgressMessageSchema = z.object({
   }),
 });
 
+export const HubAgentCreateResponseSchema = z.object({
+  type: z.literal("hub.agent.create.response"),
+  payload: z.object({
+    requestId: z.string(),
+    executionId: z.string(),
+    agentId: z.string().nullable(),
+    agent: AgentSnapshotPayloadSchema.nullable(),
+    success: z.boolean(),
+    error: z.string().nullable(),
+  }),
+});
+
+export const HubAgentUpdateSchema = z.object({
+  type: z.literal("hub.agent.update"),
+  payload: z.object({
+    executionId: z.string(),
+    agentId: z.string(),
+    agent: AgentSnapshotPayloadSchema,
+  }),
+});
+
+export const HubAgentStreamSchema = z.object({
+  type: z.literal("hub.agent.stream"),
+  payload: z.object({
+    executionId: z.string(),
+    agentId: z.string(),
+    event: AgentStreamEventPayloadSchema,
+  }),
+});
+
+export const HubExecutionReconcileResponseSchema = z.object({
+  type: z.literal("hub.execution.reconcile.response"),
+  payload: z.object({
+    requestId: z.string(),
+    executionId: z.string(),
+    agentId: z.string().nullable(),
+    agent: AgentSnapshotPayloadSchema.nullable(),
+  }),
+});
+
+export const HubAuthorizationDeniedSchema = z.object({
+  type: z.literal("hub.authorization.denied"),
+  payload: z.object({
+    requestId: z.string().optional(),
+    requestType: z.string(),
+    code: z.literal("scope_denied"),
+  }),
+});
+
+export type HubAgentCreateResponse = z.infer<typeof HubAgentCreateResponseSchema>;
+export type HubAgentUpdate = z.infer<typeof HubAgentUpdateSchema>;
+export type HubAgentStream = z.infer<typeof HubAgentStreamSchema>;
+export type HubExecutionReconcileResponse = z.infer<typeof HubExecutionReconcileResponseSchema>;
+export type HubAuthorizationDenied = z.infer<typeof HubAuthorizationDeniedSchema>;
+
+export const HubSessionOutboundMessageSchema = z.discriminatedUnion("type", [
+  HubAgentCreateResponseSchema,
+  HubAgentUpdateSchema,
+  HubAgentStreamSchema,
+  HubExecutionReconcileResponseSchema,
+  HubAuthorizationDeniedSchema,
+]);
+
+export type HubSessionOutboundMessage = z.infer<typeof HubSessionOutboundMessageSchema>;
+
+export class HubMessageCorrelationError extends Error {
+  constructor(messageType: HubSessionOutboundMessage["type"]) {
+    super(`Hub message ${messageType} has mismatched agent correlation`);
+    this.name = "HubMessageCorrelationError";
+  }
+}
+
+export function parseHubSessionOutboundMessage(value: unknown): HubSessionOutboundMessage {
+  const message = HubSessionOutboundMessageSchema.parse(value);
+  const payload = message.payload;
+  if (
+    "agent" in payload &&
+    payload.agent !== null &&
+    "agentId" in payload &&
+    payload.agentId !== null &&
+    payload.agent.id !== payload.agentId
+  ) {
+    throw new HubMessageCorrelationError(message.type);
+  }
+  return message;
+}
+
 export type DaemonUpdateProgressMessage = z.infer<typeof DaemonUpdateProgressMessageSchema>;
 
 export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
+  HubAgentCreateResponseSchema,
+  HubAgentUpdateSchema,
+  HubAgentStreamSchema,
+  HubExecutionReconcileResponseSchema,
+  HubAuthorizationDeniedSchema,
   BrowserAutomationExecuteRequestSchema,
   ActivityLogMessageSchema,
   AssistantChunkMessageSchema,
@@ -4356,6 +4527,9 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   SetVoiceModeResponseMessageSchema,
   DaemonGetStatusResponseSchema,
   DaemonGetPairingOfferResponseSchema,
+  HubRelationshipConnectResponseSchema,
+  HubRelationshipGetStatusResponseSchema,
+  HubRelationshipDisconnectResponseSchema,
   DiagnosticsResponseSchema,
   GetDaemonConfigResponseMessageSchema,
   SetDaemonConfigResponseMessageSchema,

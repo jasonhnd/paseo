@@ -3929,6 +3929,30 @@ export class DaemonClient {
     });
   }
 
+  async connectHub(hubUrl: string, token: string, requestId?: string) {
+    return this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "hub.relationship.connect.request", hubUrl, token },
+      responseType: "hub.relationship.connect.response",
+    });
+  }
+
+  async getHubStatus(requestId?: string) {
+    return this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "hub.relationship.get_status.request" },
+      responseType: "hub.relationship.get_status.response",
+    });
+  }
+
+  async disconnectHub(force = false, requestId?: string) {
+    return this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "hub.relationship.disconnect.request", force },
+      responseType: "hub.relationship.disconnect.response",
+    });
+  }
+
   async getDaemonPairingOffer(
     options?: DaemonPairingOfferOptions,
   ): Promise<DaemonPairingOfferPayload> {

@@ -20,6 +20,7 @@ import type {
   AgentSessionConfig,
 } from "../agent-sdk-types.js";
 import type { AgentStorage } from "../agent-storage.js";
+import type { AgentOwner } from "../agent-owner.js";
 import type { ProviderSnapshotManager } from "../provider-snapshot-manager.js";
 import { setupFinishNotification, startCreatedAgentInitialPrompt } from "../agent-prompt.js";
 import { resolveCreateAgentTitles } from "../create-agent-title.js";
@@ -45,7 +46,7 @@ export interface CreateAgentCommandDependencies {
   paseoHome?: string;
   worktreesRoot?: string;
   terminalManager?: TerminalManager | null;
-  providerSnapshotManager: ProviderSnapshotManager;
+  providerSnapshotManager: Pick<ProviderSnapshotManager, "resolveCreateConfig">;
   createPaseoWorktree?: CreatePaseoWorktreeWorkflowFn;
   // Mints a fresh directory workspace for a cwd and returns its id.
   ensureWorkspaceForCreate?: EnsureWorkspaceForCreate;
@@ -97,6 +98,12 @@ export interface CreateAgentFromMcpInput {
   notifyOnFinish: boolean;
   internal?: boolean;
   detached?: boolean;
+  owner?: AgentOwner;
+  env?: Record<string, string>;
+  onCreated?: (created: {
+    agentId: string;
+    createdWorktree: CreatePaseoWorktreeWorkflowResult | null;
+  }) => void;
   callerAgentId?: string;
   callerContext?: {
     lockedCwd?: string;
@@ -122,6 +129,7 @@ export interface CreateAgentCommandResult {
   background: boolean;
   initialPromptStarted: boolean;
   initialPromptError: unknown | null;
+  createdWorktree?: CreatePaseoWorktreeWorkflowResult;
 }
 
 export type BoundCreateAgentCommand = (
@@ -162,6 +170,7 @@ interface ResolvedCreateAgent {
   background: boolean;
   promptFailure: CreateAgentPromptFailureMode;
   promptLogger?: Logger;
+  createdWorktree?: CreatePaseoWorktreeWorkflowResult;
 }
 
 export async function createAgentCommand(
@@ -186,6 +195,9 @@ export async function createAgentCommand(
   let liveSnapshot = snapshot;
   let initialPromptStarted = false;
   let initialPromptError: unknown | null = null;
+  if (input.kind === "mcp") {
+    input.onCreated?.({ agentId: snapshot.id, createdWorktree: resolved.createdWorktree ?? null });
+  }
   if (resolved.prompt !== undefined) {
     const sendResult = await sendInitialPrompt(dependencies, resolved, snapshot);
     initialPromptStarted = sendResult.started;
@@ -209,6 +221,7 @@ export async function createAgentCommand(
     background: resolved.background,
     initialPromptStarted,
     initialPromptError,
+    ...(resolved.createdWorktree ? { createdWorktree: resolved.createdWorktree } : {}),
   };
 }
 
@@ -268,12 +281,13 @@ async function resolveMcpCreateAgent(
     ? requireParentAgent(dependencies.agentManager, input.callerAgentId)
     : null;
   const cwd = resolveMcpInitialCwd(input, parentAgent);
-  const { resolvedCwd, setupContinuation, createdWorkspaceId } = await resolveMcpCwd({
-    dependencies,
-    cwd,
-    worktree: input.worktree,
-    initialPrompt: input.initialPrompt ?? "",
-  });
+  const { resolvedCwd, setupContinuation, createdWorkspaceId, createdWorktree } =
+    await resolveMcpCwd({
+      dependencies,
+      cwd,
+      worktree: input.worktree,
+      initialPrompt: input.initialPrompt ?? "",
+    });
 
   const workspaceId = await resolveMcpWorkspaceId({
     dependencies,
@@ -312,9 +326,12 @@ async function resolveMcpCreateAgent(
     createOptions: {
       ...(labels ? { labels } : {}),
       workspaceId: requireResolvedWorkspaceId(workspaceId),
+      owner: input.owner,
+      env: input.env,
     },
     prompt: trimmedPrompt ? trimmedPrompt : undefined,
     setupContinuation,
+    createdWorktree,
     background: input.background,
     promptFailure: input.promptFailure ?? "log",
   };
@@ -516,6 +533,7 @@ async function resolveMcpCwd(params: {
   resolvedCwd: string;
   setupContinuation?: AgentWorktreeSetupContinuation;
   createdWorkspaceId?: string;
+  createdWorktree?: CreatePaseoWorktreeWorkflowResult;
 }> {
   const { dependencies, worktree } = params;
   if (!worktree) {
@@ -574,6 +592,7 @@ async function resolveMcpCwd(params: {
     resolvedCwd: createdWorktree.worktree.worktreePath,
     setupContinuation: createdWorktree.setupContinuation,
     createdWorkspaceId: createdWorktree.workspace.workspaceId,
+    createdWorktree,
   };
 }
 

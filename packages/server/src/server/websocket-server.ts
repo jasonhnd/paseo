@@ -30,7 +30,14 @@ import { asUint8Array, decodeBinaryFrame } from "@getpaseo/protocol/binary-frame
 import type { TerminalActivity } from "@getpaseo/protocol/terminal-activity";
 import type { HostnamesConfig } from "./hostnames.js";
 import { isHostnameAllowed } from "./hostnames.js";
-import { Session, type SessionLifecycleIntent, type SessionRuntimeMetrics } from "./session.js";
+import {
+  Session,
+  type SessionLifecycleIntent,
+  type SessionPeer,
+  type SessionRuntimeMetrics,
+} from "./session.js";
+import { HubSession, type HubExecutions } from "./hub/index.js";
+import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
 import type { AgentProvider } from "./agent/agent-sdk-types.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type { WorkspaceGitRuntimeSnapshot, WorkspaceGitService } from "./workspace-git-service.js";
@@ -95,6 +102,8 @@ interface PendingConnection {
 interface WebSocketConnectionIdentity {
   connectionId: string;
   transport: "direct" | "relay";
+  peer: "loopback" | "local_ipc" | "external";
+  browserOrigin: boolean;
   host?: string;
   origin?: string;
   userAgent?: string;
@@ -322,7 +331,7 @@ function getBrowserHostCapability(
   return parsed.success ? parsed.data : null;
 }
 
-interface WebSocketLike {
+export interface WebSocketLike {
   readyState: number;
   bufferedAmount?: number;
   send: (data: string | Uint8Array | ArrayBuffer) => void;
@@ -331,7 +340,8 @@ interface WebSocketLike {
   once: (event: "close" | "error", listener: (...args: unknown[]) => void) => void;
 }
 
-interface SessionConnection {
+interface TrustedSessionConnection {
+  kind: "trusted";
   session: Session;
   clientId: string;
   appVersion: string | null;
@@ -340,6 +350,27 @@ interface SessionConnection {
   sockets: Set<WebSocketLike>;
   externalDisconnectCleanupTimeout: ReturnType<typeof setTimeout> | null;
 }
+
+interface HubSessionConnection {
+  kind: "hub";
+  session: HubSession;
+  relationshipId: string;
+  connectionLogger: pino.Logger;
+  socket: WebSocketLike;
+}
+
+type SessionConnection = TrustedSessionConnection | HubSessionConnection;
+
+type TrustedLifecycleKey =
+  | "clientId"
+  | "appVersion"
+  | "clientCapabilities"
+  | "sockets"
+  | "externalDisconnectCleanupTimeout";
+type HubTrustedLifecycleOverlap = Extract<keyof HubSessionConnection, TrustedLifecycleKey>;
+const HUB_HAS_NO_TRUSTED_LIFECYCLE_STATE: HubTrustedLifecycleOverlap extends never ? true : never =
+  true;
+void HUB_HAS_NO_TRUSTED_LIFECYCLE_STATE;
 
 interface BrowserToolsRegistration {
   capabilitySignature: string;
@@ -401,7 +432,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly pendingConnections: Map<WebSocketLike, PendingConnection> = new Map();
   private readonly sessions: Map<WebSocketLike, SessionConnection> = new Map();
   private readonly socketIdentities: Map<WebSocketLike, WebSocketConnectionIdentity> = new Map();
-  private readonly externalSessionsByKey: Map<string, SessionConnection> = new Map();
+  private readonly externalSessionsByKey: Map<string, TrustedSessionConnection> = new Map();
   private readonly serverId: string;
   private readonly daemonVersion: string;
   private readonly daemonRuntimeConfig:
@@ -464,6 +495,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly providerUsageService: ProviderUsageService;
   private unsubscribeTerminalActivity: (() => void) | null = null;
   private readonly browserToolsBroker: BrowserToolsBroker | null;
+  private readonly hubRelationships: HubRelationshipManagement | null;
   private readonly browserToolsRegistrations = new Map<string, BrowserToolsRegistration>();
   private acceptingConnections = true;
 
@@ -521,6 +553,7 @@ export class VoiceAssistantWebSocketServer {
     },
     serviceProxyPublicBaseUrl?: string | null,
     browserToolsBroker?: BrowserToolsBroker | null,
+    hubRelationships?: HubRelationshipManagement | null,
   ) {
     this.logger = logger.child({ module: "websocket-server" });
     this.serverId = serverId;
@@ -530,6 +563,7 @@ export class VoiceAssistantWebSocketServer {
     this.daemonVersion = daemonVersion.trim();
     this.daemonRuntimeConfig = daemonRuntimeConfig;
     this.browserToolsBroker = browserToolsBroker ?? null;
+    this.hubRelationships = hubRelationships ?? null;
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
     this.projectRegistry = projectRegistry ?? createNoopProjectRegistry();
@@ -765,7 +799,10 @@ export class VoiceAssistantWebSocketServer {
 
   public broadcast(message: WSOutboundMessage): void {
     const payload = JSON.stringify(message);
-    for (const ws of this.sessions.keys()) {
+    for (const [ws, connection] of this.sessions) {
+      if (connection.kind !== "trusted") {
+        continue;
+      }
       // WebSocket.OPEN = 1
       if (ws.readyState === 1) {
         ws.send(payload);
@@ -774,12 +811,14 @@ export class VoiceAssistantWebSocketServer {
     }
   }
 
-  public listActiveSessions(): Session[] {
+  public listTrustedSessions(): Session[] {
     return Array.from(
       new Set(
-        [...this.sessions.values(), ...this.externalSessionsByKey.values()].map(
-          (connection) => connection.session,
-        ),
+        [...this.sessions.values(), ...this.externalSessionsByKey.values()]
+          .filter(
+            (connection): connection is TrustedSessionConnection => connection.kind === "trusted",
+          )
+          .map((connection) => connection.session),
       ),
     );
   }
@@ -805,6 +844,38 @@ export class VoiceAssistantWebSocketServer {
       this.incrementRuntimeCounter("relayExternalSocketAttached");
     }
     await this.attachSocket(ws, undefined, metadata);
+  }
+
+  public async attachHubSocket(
+    ws: WebSocketLike,
+    options: {
+      relationshipId: string;
+      executions: HubExecutions;
+    },
+  ): Promise<void> {
+    if (!this.acceptingConnections) {
+      ws.close(WS_CLOSE_SERVER_SHUTDOWN, "Server shutting down");
+      return;
+    }
+
+    const connectionLogger = this.logger.child({
+      connectionKind: "hub",
+      relationshipId: options.relationshipId,
+    });
+    const session = new HubSession({
+      executions: options.executions,
+      send: (message) => this.sendToClient(ws, wrapSessionMessage(message)),
+    });
+    const connection: HubSessionConnection = {
+      kind: "hub",
+      session,
+      relationshipId: options.relationshipId,
+      connectionLogger,
+      socket: ws,
+    };
+    this.sessions.set(ws, connection);
+    this.bindSocketHandlers(ws);
+    connectionLogger.info("Hub session attached");
   }
 
   public prepareForShutdown(): void {
@@ -842,13 +913,14 @@ export class VoiceAssistantWebSocketServer {
 
     const cleanupPromises: Promise<void>[] = [];
     for (const connection of uniqueConnections) {
-      if (connection.externalDisconnectCleanupTimeout) {
+      if (connection.kind === "trusted" && connection.externalDisconnectCleanupTimeout) {
         clearTimeout(connection.externalDisconnectCleanupTimeout);
         connection.externalDisconnectCleanupTimeout = null;
       }
 
-      cleanupPromises.push(connection.session.cleanup());
-      for (const ws of connection.sockets) {
+      cleanupPromises.push(Promise.resolve(connection.session.cleanup()));
+      const sockets = connection.kind === "trusted" ? connection.sockets : [connection.socket];
+      for (const ws of sockets) {
         cleanupPromises.push(
           new Promise<void>((resolve) => {
             // WebSocket.CLOSED = 3
@@ -918,12 +990,16 @@ export class VoiceAssistantWebSocketServer {
   }
 
   private sendToConnection(connection: SessionConnection, message: WSOutboundMessage): void {
-    for (const ws of connection.sockets) {
+    const sockets = connection.kind === "trusted" ? connection.sockets : [connection.socket];
+    for (const ws of sockets) {
       this.sendToClient(ws, message);
     }
   }
 
   private sendBinaryToConnection(connection: SessionConnection, frame: Uint8Array): void {
+    if (connection.kind !== "trusted") {
+      return;
+    }
     for (const ws of connection.sockets) {
       this.sendBinaryToClient(ws, frame);
     }
@@ -991,9 +1067,9 @@ export class VoiceAssistantWebSocketServer {
     appVersion: string | null;
     clientCapabilities: Record<string, unknown> | null;
     connectionLogger: pino.Logger;
-  }): SessionConnection {
+  }): TrustedSessionConnection {
     const { ws, clientId, appVersion, clientCapabilities, connectionLogger } = params;
-    let connection: SessionConnection | null = null;
+    let connection: TrustedSessionConnection | null = null;
 
     const session = new Session({
       clientId,
@@ -1092,9 +1168,11 @@ export class VoiceAssistantWebSocketServer {
       daemonVersion: this.daemonVersion,
       daemonRuntimeConfig: this.daemonRuntimeConfig,
       getWebSocketRuntimeMetrics: () => this.lastRuntimeMetricsSnapshot,
+      hubRelationships: this.hubRelationships ?? undefined,
     });
 
     connection = {
+      kind: "trusted",
       session,
       clientId,
       appVersion,
@@ -1372,6 +1450,15 @@ export class VoiceAssistantWebSocketServer {
     }
 
     this.sessions.delete(ws);
+    if (connection.kind === "hub") {
+      this.socketIdentities.delete(ws);
+      connection.connectionLogger.info(
+        { code: details.code, reason: stringifyCloseReason(details.reason) },
+        "Hub session disconnected",
+      );
+      connection.session.cleanup();
+      return;
+    }
     connection.sockets.delete(ws);
     this.socketIdentities.delete(ws);
 
@@ -1420,7 +1507,7 @@ export class VoiceAssistantWebSocketServer {
   }
 
   private async cleanupConnection(
-    connection: SessionConnection,
+    connection: TrustedSessionConnection,
     logMessage: string,
   ): Promise<void> {
     this.incrementRuntimeCounter("sessionCleanup");
@@ -1447,7 +1534,7 @@ export class VoiceAssistantWebSocketServer {
     await connection.session.cleanup();
   }
 
-  private syncBrowserToolsClientRegistration(connection: SessionConnection): void {
+  private syncBrowserToolsClientRegistration(connection: TrustedSessionConnection): void {
     if (!this.browserToolsBroker) {
       return;
     }
@@ -1523,7 +1610,7 @@ export class VoiceAssistantWebSocketServer {
 
     log.warn(
       {
-        clientId: activeConnection?.clientId,
+        clientId: activeConnection?.kind === "trusted" ? activeConnection.clientId : undefined,
         requestId: requestInfo?.requestId,
         requestType: requestInfo?.requestType,
         error: parsedMessage.error.message,
@@ -1586,6 +1673,11 @@ export class VoiceAssistantWebSocketServer {
       } catch {
         // ignore close errors
       }
+      return true;
+    }
+    if (activeConnection.kind === "hub") {
+      log.warn("Rejected binary frame on Hub session");
+      ws.close(WS_CLOSE_INVALID_HELLO, "Binary frames are not supported on Hub sessions");
       return true;
     }
     void Promise.resolve(activeConnection.session.handleBinaryFrame(decodedFrame)).catch(
@@ -1727,25 +1819,40 @@ export class VoiceAssistantWebSocketServer {
     const controlRpc = getControlRpcLogInfo(message.message);
     if (controlRpc) {
       const identity = this.socketIdentities.get(ws);
+      let connectionFields: Record<string, unknown>;
+      if (identity) {
+        connectionFields = toConnectionLogFields(identity);
+      } else if (activeConnection.kind === "trusted") {
+        connectionFields = { clientId: activeConnection.clientId };
+      } else {
+        connectionFields = { relationshipId: activeConnection.relationshipId };
+      }
       activeConnection.connectionLogger.warn(
         {
-          ...(identity ? toConnectionLogFields(identity) : { clientId: activeConnection.clientId }),
+          ...connectionFields,
           ...controlRpc,
         },
         "ws_control_rpc_received",
       );
     }
-    if (message.message.type === "browser.automation.execute.response") {
+    if (
+      activeConnection.kind === "trusted" &&
+      message.message.type === "browser.automation.execute.response"
+    ) {
       this.browserToolsBroker?.receiveResponse(message.message as BrowserAutomationExecuteResponse);
       return;
     }
 
     const startMs = performance.now();
-    await activeConnection.session.handleMessage(message.message);
+    const identity = this.socketIdentities.get(ws);
+    const peer = identity
+      ? toSessionPeer(identity)
+      : ({ transport: "internal", peer: "internal" } satisfies SessionPeer);
+    await activeConnection.session.handleMessage(message.message, peer);
     const durationMs = performance.now() - startMs;
     this.recordRequestLatency(message.message.type, durationMs);
 
-    if (durationMs >= SLOW_REQUEST_THRESHOLD_MS) {
+    if (durationMs >= SLOW_REQUEST_THRESHOLD_MS && activeConnection.kind === "trusted") {
       activeConnection.connectionLogger.warn(
         {
           requestType: message.message.type,
@@ -1857,7 +1964,9 @@ export class VoiceAssistantWebSocketServer {
   }
 
   private collectSessionRuntimeMetrics(): WebSocketRuntimeMetrics {
-    const uniqueConnections = new Set<SessionConnection>(this.externalSessionsByKey.values());
+    const uniqueConnections = new Set<TrustedSessionConnection>(
+      this.externalSessionsByKey.values(),
+    );
     let terminalDirectorySubscriptionCount = 0;
     let terminalSubscriptionCount = 0;
     let inflightRequests = 0;
@@ -1958,6 +2067,9 @@ export class VoiceAssistantWebSocketServer {
     }> = [];
 
     for (const [ws, connection] of this.sessions) {
+      if (connection.kind !== "trusted") {
+        continue;
+      }
       clientEntries.push({
         ws,
         state: this.getClientActivityState(connection.session),
@@ -2025,6 +2137,9 @@ export class VoiceAssistantWebSocketServer {
     }> = [];
 
     for (const [ws, connection] of this.sessions) {
+      if (connection.kind !== "trusted") {
+        continue;
+      }
       clientEntries.push({
         ws,
         state: this.getClientActivityState(connection.session),
@@ -2099,6 +2214,8 @@ function createWebSocketConnectionIdentity(
   return {
     connectionId: `conn_${randomUUID().replaceAll("-", "")}`,
     transport: metadata?.transport === "relay" ? "relay" : "direct",
+    peer: resolveConnectionPeer(requestMetadata, metadata),
+    browserOrigin: requestMetadata.origin !== undefined,
     ...(requestMetadata.host ? { host: requestMetadata.host } : {}),
     ...(requestMetadata.origin ? { origin: requestMetadata.origin } : {}),
     ...(requestMetadata.userAgent ? { userAgent: requestMetadata.userAgent } : {}),
@@ -2111,6 +2228,7 @@ function toConnectionLogFields(identity: WebSocketConnectionIdentity): Record<st
   return {
     connectionId: identity.connectionId,
     transport: identity.transport,
+    peer: identity.peer,
     ...(identity.host ? { host: identity.host } : {}),
     ...(identity.origin ? { origin: identity.origin } : {}),
     ...(identity.userAgent ? { userAgent: identity.userAgent } : {}),
@@ -2120,6 +2238,33 @@ function toConnectionLogFields(identity: WebSocketConnectionIdentity): Record<st
     ...(identity.sessionId ? { sessionId: identity.sessionId } : {}),
     ...(identity.appVersion ? { appVersion: identity.appVersion } : {}),
   };
+}
+
+function resolveConnectionPeer(
+  requestMetadata: SocketRequestMetadata,
+  metadata: ExternalSocketMetadata | undefined,
+): WebSocketConnectionIdentity["peer"] {
+  if (metadata?.transport === "relay") return "external";
+  if (!requestMetadata.remoteAddress) return "local_ipc";
+  return isLoopbackAddress(requestMetadata.remoteAddress) ? "loopback" : "external";
+}
+
+function toSessionPeer(identity: WebSocketConnectionIdentity): SessionPeer {
+  if (identity.transport === "relay") {
+    return { transport: "relay", peer: "external" };
+  }
+  return {
+    transport: "direct",
+    peer: identity.peer,
+    browserOrigin: identity.browserOrigin,
+  };
+}
+
+function isLoopbackAddress(address: string): boolean {
+  const normalized = address.toLowerCase();
+  if (normalized === "::1") return true;
+  const ipv4 = normalized.startsWith("::ffff:") ? normalized.slice("::ffff:".length) : normalized;
+  return ipv4.startsWith("127.");
 }
 
 function extractSocketRequestMetadata(request: unknown): SocketRequestMetadata {

@@ -147,23 +147,11 @@ export class CreateAgentLifecycleDispatch {
     agentId: string,
     options: { worktreePath: string | null; repoRoot: string | null },
   ): void {
-    const unsubscribe = this.dependencies.agentManager.subscribe(
-      (event) => {
-        if (event.type !== "agent_stream") {
-          return;
-        }
-        if (
-          event.event.type !== "turn_completed" &&
-          event.event.type !== "turn_failed" &&
-          event.event.type !== "turn_canceled"
-        ) {
-          return;
-        }
-        unsubscribe();
-        void this.autoArchiveAgentOnce(agentId, options);
-      },
-      { agentId, replayState: false },
-    );
+    registerAgentAutoArchive({
+      agentManager: this.dependencies.agentManager,
+      agentId,
+      archive: () => this.autoArchiveAgentOnce(agentId, options),
+    });
   }
 
   private async autoArchiveAgentOnce(
@@ -249,4 +237,26 @@ export class CreateAgentLifecycleDispatch {
       this.dependencies.emitAgentRemove(options.agentId);
     }
   }
+}
+
+export function registerAgentAutoArchive(input: {
+  agentManager: AgentManager;
+  agentId: string;
+  archive: () => Promise<unknown>;
+}): void {
+  const unsubscribe = input.agentManager.subscribe(
+    (event) => {
+      if (event.type !== "agent_stream") return;
+      if (
+        event.event.type !== "turn_completed" &&
+        event.event.type !== "turn_failed" &&
+        event.event.type !== "turn_canceled"
+      ) {
+        return;
+      }
+      unsubscribe();
+      void input.archive();
+    },
+    { agentId: input.agentId, replayState: false },
+  );
 }

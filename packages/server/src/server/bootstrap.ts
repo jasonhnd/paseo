@@ -172,6 +172,18 @@ import {
   createAgentCommand,
   type CreateAgentCommandDependencies,
 } from "./agent/create-agent/create.js";
+import { archiveAgentCommand } from "./agent/lifecycle-command.js";
+import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
+import {
+  HubRelationshipController,
+  type HubRelationshipClock,
+  type HubRelationshipRetryPolicy,
+} from "./hub/relationship-controller.js";
+import {
+  DirectHubRelationshipRemote,
+  type HubRelationshipRemote,
+} from "./hub/relationship-remote.js";
+import { RelationshipOwnedExecutions } from "./hub/relationship-owned-executions.js";
 
 const MAX_MCP_DEBUG_BATCH_ITEMS = 10;
 const REDACTED_LOG_VALUE = "[redacted]";
@@ -402,6 +414,12 @@ export interface PaseoDaemon {
   getListenTarget(): ListenTarget | null;
 }
 
+export interface PaseoDaemonDependencies {
+  hubRelationshipRemote?: HubRelationshipRemote;
+  hubRelationshipClock?: HubRelationshipClock;
+  hubRelationshipRetryPolicy?: HubRelationshipRetryPolicy;
+}
+
 function createBootstrapManagedProcessRegistry(
   config: Pick<PaseoDaemonConfig, "paseoHome" | "managedProcesses">,
   logger: Logger,
@@ -479,6 +497,7 @@ function createInitialMutableDaemonConfig(config: PaseoDaemonConfig): MutableDae
 export async function createPaseoDaemon(
   config: PaseoDaemonConfig,
   rootLogger: Logger,
+  dependencies: PaseoDaemonDependencies = {},
 ): Promise<PaseoDaemon> {
   const logger = rootLogger.child({ module: "bootstrap" });
   const bootstrapStart = performance.now();
@@ -545,7 +564,7 @@ export async function createPaseoDaemon(
     serviceProxy,
     onChange: createScriptStatusEmitter({
       sessions: () =>
-        wsServer?.listActiveSessions().map((session) => ({
+        wsServer?.listTrustedSessions().map((session) => ({
           emit: (message) => session.emitServerMessage(message),
         })) ?? [],
       serviceProxy,
@@ -809,7 +828,7 @@ export async function createPaseoDaemon(
     workspaceGitService,
   });
   const archiveWorkspaceRecordExternal = async (workspaceId: string) => {
-    const sessions = wsServer?.listActiveSessions() ?? [];
+    const sessions = wsServer?.listTrustedSessions() ?? [];
     if (sessions.length > 0) {
       await Promise.all(
         sessions.map((session) => session.archiveWorkspaceRecordForExternalMutation(workspaceId)),
@@ -856,20 +875,20 @@ export async function createPaseoDaemon(
   };
   const markWorkspaceArchivingExternal = (workspaceIds: Iterable<string>, archivingAt: string) => {
     const workspaceIdList = Array.from(workspaceIds);
-    for (const session of wsServer?.listActiveSessions() ?? []) {
+    for (const session of wsServer?.listTrustedSessions() ?? []) {
       session.markWorkspaceArchivingForExternalMutation(workspaceIdList, archivingAt);
     }
   };
   const clearWorkspaceArchivingExternal = (workspaceIds: Iterable<string>) => {
     const workspaceIdList = Array.from(workspaceIds);
-    for (const session of wsServer?.listActiveSessions() ?? []) {
+    for (const session of wsServer?.listTrustedSessions() ?? []) {
       session.clearWorkspaceArchivingForExternalMutation(workspaceIdList);
     }
   };
   const emitWorkspaceUpdatesExternal = async (workspaceIds: Iterable<string>) => {
     const workspaceIdList = Array.from(workspaceIds);
     await Promise.all(
-      (wsServer?.listActiveSessions() ?? []).map((session) =>
+      (wsServer?.listTrustedSessions() ?? []).map((session) =>
         session.emitWorkspaceUpdatesForExternalWorkspaceIds(workspaceIdList),
       ),
     );
@@ -949,7 +968,7 @@ export async function createPaseoDaemon(
         warmWorkspaceGitData: async (workspace) => {
           await Promise.all(
             wsServer
-              ?.listActiveSessions()
+              ?.listTrustedSessions()
               .map((session) => session.warmWorkspaceGitDataForWorkspace(workspace)) ?? [],
           );
         },
@@ -988,6 +1007,54 @@ export async function createPaseoDaemon(
   };
   const createAgent = (input: Parameters<typeof createAgentCommand>[1]) =>
     createAgentCommand(createAgentCommandDependencies, input);
+  const hubAgentLifecycle = new CreateAgentLifecycleDispatch({
+    paseoHome: config.paseoHome,
+    worktreesRoot: config.worktreesRoot,
+    agentManager,
+    agentStorage,
+    github,
+    workspaceGitService,
+    createPaseoWorktreeWorkflow: createPaseoWorktreeForTools,
+    archiveAgentForClose: (agentId) =>
+      archiveAgentCommand({ agentManager, agentStorage, logger }, agentId),
+    findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
+    listActiveWorkspaces: listActiveWorkspacesExternal,
+    archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
+    emit: emitExternalSessionMessage,
+    emitAgentRemove: () => undefined,
+    emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
+    markWorkspaceArchiving: markWorkspaceArchivingExternal,
+    clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
+    killTerminalsForWorkspace: (workspaceId) =>
+      killTerminalsForWorkspace({ terminalManager, sessionLogger: logger }, workspaceId),
+    logger,
+  });
+  const hubRelationships = new HubRelationshipController({
+    paseoHome: config.paseoHome,
+    serverId,
+    daemonPublicKey: daemonKeyPair.publicKeyB64,
+    logger,
+    remote: dependencies.hubRelationshipRemote ?? new DirectHubRelationshipRemote(),
+    clock: dependencies.hubRelationshipClock,
+    retryPolicy: dependencies.hubRelationshipRetryPolicy,
+    attachSocket: async (socket, options) => {
+      if (!wsServer) throw new Error("WebSocket server is not running");
+      await wsServer.attachHubSocket(socket, options);
+    },
+    createExecutions: (relationshipId) =>
+      new RelationshipOwnedExecutions({
+        relationshipId,
+        agentManager,
+        agentStorage,
+        createAgent,
+        registerAutoArchive: ({ agentId, createdWorktree }) =>
+          hubAgentLifecycle.registerAutoArchiveIfRequested({
+            autoArchive: true,
+            agentId,
+            createdWorktree,
+          }),
+      }),
+  });
 
   const loopService = new LoopService({
     paseoHome: config.paseoHome,
@@ -1381,7 +1448,9 @@ export async function createPaseoDaemon(
               },
               serviceProxyPublicBaseUrl,
               browserToolsBroker,
+              hubRelationships,
             );
+            await hubRelationships.start();
 
             if (relayEnabled) {
               const offer = await createConnectionOfferV2({
@@ -1442,6 +1511,7 @@ export async function createPaseoDaemon(
   };
 
   const stop = async () => {
+    await hubRelationships.stop();
     scriptHealthMonitor.stop();
     // Freeze both ingress and registration before taking the agent closure snapshot.
     wsServer?.prepareForShutdown();
@@ -1495,7 +1565,9 @@ async function closeAllAgents(logger: Logger, agentManager: AgentManager): Promi
   await Promise.all(
     agents.map(async (agent) => {
       try {
-        await agentManager.closeAgent(agent.id);
+        await agentManager.closeAgent(agent.id, {
+          persistClosedState: agent.owner?.kind !== "hub",
+        });
       } catch (err) {
         logger.error({ err, agentId: agent.id }, "Failed to close agent");
       }

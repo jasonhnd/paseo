@@ -1046,7 +1046,16 @@ export class HubRelationshipHarness {
     const entrypoint = path.join(import.meta.dirname, "../../test-utils/hub-cli-entry.ts");
     const { stdout } = await execFileAsync(
       process.execPath,
-      ["--import", "tsx", entrypoint, ...args, "--host", this.host, "--json"],
+      [
+        "--conditions=source",
+        "--import",
+        "tsx",
+        entrypoint,
+        ...args,
+        "--host",
+        this.host,
+        "--json",
+      ],
       { cwd: REPOSITORY_ROOT, env: { ...process.env, NO_COLOR: "1" } },
     );
     const parsed = JSON.parse(stdout) as unknown;

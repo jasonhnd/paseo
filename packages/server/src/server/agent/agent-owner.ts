@@ -2,15 +2,15 @@ import { z } from "zod";
 
 export const AgentOwnerSchema = z.discriminatedUnion("kind", [
   z.object({
-    kind: z.literal("hub"),
-    relationshipId: z.string(),
+    kind: z.literal("daemon"),
+    daemonId: z.string(),
     executionId: z.string(),
   }),
 ]);
 
 export type AgentOwner = z.infer<typeof AgentOwnerSchema>;
-export type HubAgentOwner = Extract<AgentOwner, { kind: "hub" }>;
+export type DaemonAgentOwner = Extract<AgentOwner, { kind: "daemon" }>;
 
-export function hubExecutionKey(owner: HubAgentOwner): string {
-  return `${owner.relationshipId}\0${owner.executionId}`;
+export function daemonExecutionKey(owner: DaemonAgentOwner): string {
+  return `${owner.daemonId}\0${owner.executionId}`;
 }

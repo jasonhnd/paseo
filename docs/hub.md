@@ -15,29 +15,34 @@ The daemon persists a relationship ID and private connection credential before e
 relationship is independent of its current transport, so a future transport can replace the direct
 WebSocket without pairing again. The current foundation supports one Hub relationship per daemon.
 
-Normal authenticated daemon sessions may run the `hub.relationship.connect`,
-`hub.relationship.get_status`, and `hub.relationship.disconnect` RPCs regardless of transport.
-The restricted Hub session cannot manage the relationship.
+Normal authenticated daemon sessions may run the `hub.management.daemon.connect`,
+`hub.management.daemon.get_status`, and `hub.management.daemon.disconnect` RPCs. Hub connections
+receive only `hub.execution.*` authority, so execution credentials cannot manage the relationship.
 
-## Hub session scope
+## Session grants and execution ownership
 
-An accepted Hub socket receives a dedicated `HubSession`, not the daemon's general client `Session`.
-Its inbound allowlist contains only the `hub.*` operations required for Hub-owned execution, and its
-outbound events include only agents owned by that relationship. Unrelated local agents, browser
-control, retained client sessions, binary channels, and ordinary daemon broadcasts are outside the
-Hub surface.
+Trusted clients and the Hub use the same `Session` implementation. The connection boundary supplies
+grants: trusted clients receive `*`, while an enrolled Hub connection receives its persisted
+`hub.execution.*` grant. One matcher handles exact RPC names and trailing namespace wildcards for
+both inbound requests and outbound messages. A denied request returns the ordinary `rpc_error`
+shape.
+
+The Hub connection still has a narrow lifecycle boundary: it has no trusted-client hello/resume,
+browser, binary, retained-session, or broadcast state. Its outbound execution events include only
+agents owned by that daemon identity, so unrelated local agents remain outside the Hub surface.
 
 Each Hub create carries an execution ID. The daemon stores that ID with the agent's relationship
-owner before acknowledging creation. Duplicate or replayed creates for the same relationship and
-execution resolve to the same durable agent. On reconnect or daemon restart, Hub reconciliation
-reads that stored association and returns current state; transient stream frames are not durably
-replayed.
+owner before acknowledging creation. Duplicate or replayed creates for the same daemon and
+execution resolve to the same durable agent. After a lost response, reconnect, or daemon restart,
+the Hub retries `hub.execution.agent.create.request` with the same execution ID. The idempotent
+response returns the existing agent and its current state; there is no separate reconciliation RPC.
+Transient stream frames are not durably replayed.
 
 Daemon restart preserves the Hub relationship and owned execution identity, but interrupts any
-active turn. The daemon persists that agent as `closed`; reconciliation returns the same relationship,
-execution, and agent with that terminal state. Paseo never stores or automatically replays the
-original prompt. A duplicate create remains idempotent and returns the existing agent without
-starting another turn.
+active turn. The daemon persists that agent as `closed`; an idempotent create retry returns the same
+daemon, execution, and agent identity with that terminal state. Paseo never stores or automatically
+replays the original prompt. A duplicate create returns the existing agent without starting another
+turn.
 
 Hub creates use the same agent creation path as trusted clients. They may select any existing
 worktree target shape and may request `autoArchive`. Worktree creation and terminal auto-archive use
@@ -59,9 +64,9 @@ opening a Hub socket. This also covers an enrollment whose request may have succ
 response was lost. `--force` removes local authority immediately and warns that remote revocation may
 still be pending.
 
-## Cross-repository dependency
+## Cross-repository compatibility
 
-The consumer implementation lives in Paseo Cloud and depends on the Paseo protocol, client, server,
-and CLI package versions that expose this Hub surface. Cross-repository end-to-end verification must
-install those packages together and exercise the real daemon, CLI, direct WebSocket, Cloud service,
-and Postgres. A Paseo Cloud change must not assume unpublished local package contents.
+The consumer implementation lives in Paseo Cloud. Cloud owns its copy of the Hub wire schemas and
+has no Paseo runtime or build dependency. Cross-repository end-to-end verification separately builds
+a Paseo source checkout and exercises the real daemon, CLI, direct WebSocket, Cloud service, and
+Postgres. That compatibility fixture is not a package dependency or fallback implementation.

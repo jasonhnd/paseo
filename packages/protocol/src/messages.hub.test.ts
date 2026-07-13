@@ -5,7 +5,7 @@ import {
   HubMessageCorrelationError,
   SessionInboundMessageSchema,
   SessionOutboundMessageSchema,
-  parseHubSessionOutboundMessage,
+  parseHubExecutionOutboundMessage,
 } from "./messages.js";
 
 const agent = {
@@ -38,7 +38,7 @@ const agent = {
 
 // Frozen at the Hub create request shape shipped before worktree and autoArchive.
 const PreviousHubAgentCreateRequestSchema = z.object({
-  type: z.literal("hub.agent.create.request"),
+  type: z.literal("hub.execution.agent.create.request"),
   requestId: z.string(),
   executionId: z.string(),
   provider: z.string(),
@@ -53,22 +53,17 @@ const PreviousHubAgentCreateRequestSchema = z.object({
 });
 
 describe("Hub session protocol", () => {
-  test.each([
-    {
-      type: "hub.agent.create.request",
+  test("accepts the Hub execution create request", () => {
+    const message = {
+      type: "hub.execution.agent.create.request",
       requestId: "request-1",
       executionId: "execution-1",
       provider: "codex",
       cwd: "/workspace",
       prompt: "Implement the requested change",
       modeId: "code",
-    },
-    {
-      type: "hub.execution.reconcile.request",
-      requestId: "request-2",
-      executionId: "execution-1",
-    },
-  ])("accepts inbound variant $type", (message) => {
+    };
+
     expect(SessionInboundMessageSchema.parse(message)).toEqual(message);
   });
 
@@ -79,7 +74,7 @@ describe("Hub session protocol", () => {
     { mode: "checkout-pr", prNumber: 42 },
   ])("accepts Hub create worktree target %#", (worktree) => {
     const message = {
-      type: "hub.agent.create.request",
+      type: "hub.execution.agent.create.request",
       requestId: "hub-worktree",
       executionId: "execution-worktree",
       provider: "codex",
@@ -93,7 +88,7 @@ describe("Hub session protocol", () => {
 
   test("the previous Hub create parser ignores additive worktree and auto-archive fields", () => {
     const newRequest = {
-      type: "hub.agent.create.request" as const,
+      type: "hub.execution.agent.create.request" as const,
       requestId: "hub-worktree",
       executionId: "execution-worktree",
       provider: "codex",
@@ -104,7 +99,7 @@ describe("Hub session protocol", () => {
     };
 
     expect(PreviousHubAgentCreateRequestSchema.parse(newRequest)).toEqual({
-      type: "hub.agent.create.request",
+      type: "hub.execution.agent.create.request",
       requestId: "hub-worktree",
       executionId: "execution-worktree",
       provider: "codex",
@@ -115,7 +110,7 @@ describe("Hub session protocol", () => {
 
   test.each([
     {
-      type: "hub.agent.create.response",
+      type: "hub.execution.agent.create.response",
       payload: {
         requestId: "request-1",
         executionId: "execution-1",
@@ -126,84 +121,67 @@ describe("Hub session protocol", () => {
       },
     },
     {
-      type: "hub.agent.update",
+      type: "hub.execution.agent.update",
       payload: { executionId: "execution-1", agentId: "agent-1", agent },
     },
     {
-      type: "hub.agent.stream",
+      type: "hub.execution.agent.stream",
       payload: {
         executionId: "execution-1",
         agentId: "agent-1",
         event: { type: "turn_started", provider: "codex" },
       },
     },
-    {
-      type: "hub.execution.reconcile.response",
-      payload: {
-        requestId: "request-2",
-        executionId: "execution-1",
-        agentId: "agent-1",
-        agent,
-      },
-    },
-    {
-      type: "hub.authorization.denied",
-      payload: {
-        requestId: "request-3",
-        requestType: "daemon.get_status.request",
-        code: "scope_denied",
-      },
-    },
   ])("accepts outbound variant $type", (message) => {
     expect(SessionOutboundMessageSchema.parse(message)).toEqual(message);
-    expect(parseHubSessionOutboundMessage(message)).toEqual(message);
+    expect(parseHubExecutionOutboundMessage(message)).toEqual(message);
   });
 
   test("rejects a Hub update whose correlated agent ids disagree", () => {
     const malformed = {
-      type: "hub.agent.update",
+      type: "hub.execution.agent.update",
       payload: { executionId: "execution-1", agentId: "agent-2", agent },
     };
 
     expect(SessionOutboundMessageSchema.safeParse(malformed).success).toBe(true);
-    expect(() => parseHubSessionOutboundMessage(malformed)).toThrow(HubMessageCorrelationError);
+    expect(() => parseHubExecutionOutboundMessage(malformed)).toThrow(HubMessageCorrelationError);
   });
 
   test.each([
     {
-      type: "hub.relationship.connect.request",
+      type: "hub.management.daemon.connect.request",
       requestId: "r1",
       hubUrl: "https://hub.example",
       token: "token",
     },
-    { type: "hub.relationship.get_status.request", requestId: "r2" },
-    { type: "hub.relationship.disconnect.request", requestId: "r3", force: true },
+    { type: "hub.management.daemon.get_status.request", requestId: "r2" },
+    { type: "hub.management.daemon.disconnect.request", requestId: "r3", force: true },
   ])("accepts trusted management request $type", (message) => {
     expect(SessionInboundMessageSchema.parse(message)).toEqual(message);
   });
 
   test.each([
     {
-      type: "hub.relationship.connect.response",
+      type: "hub.management.daemon.connect.response",
       payload: {
         requestId: "r1",
         status: {
           state: "connected",
-          relationshipId: "rel",
+          daemonId: "daemon-1",
           hubOrigin: "https://hub.example",
-          scopes: ["hub.*"],
+          scopes: ["hub.execution.*"],
           connectedAt: "2026-07-13T00:00:00.000Z",
           lastError: null,
         },
       },
     },
     {
-      type: "hub.relationship.get_status.response",
+      type: "hub.management.daemon.get_status.response",
       payload: {
         requestId: "r2",
         status: {
           state: "not_connected",
-          relationshipId: null,
+          daemonId: null,
           hubOrigin: null,
           scopes: [],
           connectedAt: null,
@@ -212,14 +190,14 @@ describe("Hub session protocol", () => {
       },
     },
     {
-      type: "hub.relationship.disconnect.response",
+      type: "hub.management.daemon.disconnect.response",
       payload: {
         requestId: "r3",
         status: {
           state: "disconnecting",
-          relationshipId: "rel",
+          daemonId: "daemon-1",
           hubOrigin: "https://hub.example",
-          scopes: ["hub.*"],
+          scopes: ["hub.execution.*"],
           connectedAt: null,
           lastError: "offline",
         },

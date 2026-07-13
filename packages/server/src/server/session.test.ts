@@ -13,7 +13,7 @@ import {
   FileTransferOpcode,
   type FileTransferFrame,
 } from "@getpaseo/protocol/binary-frames/index";
-import { Session } from "./session.js";
+import { isSessionRpcGranted, Session } from "./session.js";
 import { DownloadTokenStore } from "./file-download/token-store.js";
 import { StructuredAgentFallbackError } from "./agent/agent-response-loop.js";
 import type { StoredAgentRecord } from "./agent/agent-storage.js";
@@ -188,6 +188,7 @@ vi.mock("./worktree-bootstrap.js", async (importOriginal) => {
 });
 
 interface SessionForTestOptions {
+  grants?: readonly string[];
   agentManager?: { [K in keyof SessionOptions["agentManager"]]?: unknown };
   agentStorage?: { [K in keyof SessionOptions["agentStorage"]]?: unknown };
   github?: Partial<GitHubService>;
@@ -248,7 +249,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
   };
   const messages = options.messages ?? [];
 
-  return new Session({
+  const sessionOptions: SessionOptions & { grants?: readonly string[] } = {
     clientId: "test-client",
     onMessage: (message) => messages.push(message),
     onBinaryMessage: createBinaryMessageHandler(options.binaryMessages),
@@ -304,8 +305,50 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     serverId: options.serverId,
     daemonVersion: options.daemonVersion,
     daemonRuntimeConfig: options.daemonRuntimeConfig,
-  });
+    grants: options.grants,
+  };
+  return new Session(sessionOptions);
 }
+
+describe("session authorization grants", () => {
+  test("rejects an RPC outside an exact grant with the generic RPC error", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      grants: ["hub.execution.agent.create.request"],
+      messages,
+    });
+
+    await session.handleMessage({ type: "ping", requestId: "restricted-ping", clientSentAt: 42 });
+
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "restricted-ping",
+          requestType: "ping",
+          error: "Session is not authorized for ping",
+          code: "access_denied",
+        },
+      },
+    ]);
+  });
+
+  test.each([
+    ["*", "ping"],
+    ["hub.execution.*", "hub.execution.agent.create.request"],
+    ["hub.execution.agent.create.request", "hub.execution.agent.create.request"],
+  ])("grant %s authorizes %s", (grant, requestType) => {
+    expect(isSessionRpcGranted([grant], requestType)).toBe(true);
+  });
+
+  test.each([
+    ["hub.execution.*", "hub.management.daemon.get_status.request"],
+    ["hub.execution.agent.create.request", "hub.execution.agent.update"],
+    ["hub.execution.*", "hub.executions.agent.create.request"],
+  ])("grant %s rejects %s", (grant, requestType) => {
+    expect(isSessionRpcGranted([grant], requestType)).toBe(false);
+  });
+});
 
 describe("file explorer binary responses", () => {
   const tempDirs: string[] = [];

@@ -11,9 +11,9 @@ import type { BoundCreateAgentCommand } from "../agent/create-agent/create.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../worktree-session.js";
 import { buildStoredAgentPayload } from "../agent/agent-projections.js";
 import { serializeAgentSnapshot, serializeAgentStreamEvent } from "../messages.js";
-import { hubExecutionKey, type HubAgentOwner } from "../agent/agent-owner.js";
+import { daemonExecutionKey, type DaemonAgentOwner } from "../agent/agent-owner.js";
 
-export interface HubAgentCreateInput {
+export interface HubExecutionAgentCreateInput {
   executionId: string;
   provider: string;
   cwd: string;
@@ -42,8 +42,8 @@ export type OwnedAgentEvent =
       event: AgentStreamEventPayload;
     };
 
-interface RelationshipOwnedExecutionsOptions {
-  relationshipId: string;
+interface DaemonExecutionsOptions {
+  daemonId: string;
   agentManager: AgentManager;
   agentStorage: AgentStorage;
   createAgent: BoundCreateAgentCommand;
@@ -57,15 +57,14 @@ interface RelationshipOwnedExecutionsOptions {
   }) => Promise<void>;
 }
 
-export interface HubExecutions {
-  create(input: HubAgentCreateInput): Promise<OwnedAgentSnapshot>;
-  reconcile(executionId: string): Promise<OwnedAgentSnapshot | null>;
+export interface HubExecutionAgents {
+  create(input: HubExecutionAgentCreateInput): Promise<OwnedAgentSnapshot>;
   subscribe(listener: (event: OwnedAgentEvent) => void): () => void;
   invalidateAuthority(): Promise<void>;
 }
 
-export class RelationshipOwnedExecutions implements HubExecutions {
-  private readonly relationshipId: string;
+export class DaemonExecutions implements HubExecutionAgents {
+  private readonly daemonId: string;
   private readonly agentManager: AgentManager;
   private readonly agentStorage: AgentStorage;
   private readonly createAgentCommand: BoundCreateAgentCommand;
@@ -76,12 +75,10 @@ export class RelationshipOwnedExecutions implements HubExecutions {
     agentId: string;
     createdWorktree: CreatePaseoWorktreeWorkflowResult | null;
   }) => LifecycleRegistration;
-  private readonly cleanupFailedCreate: NonNullable<
-    RelationshipOwnedExecutionsOptions["cleanupFailedCreate"]
-  >;
+  private readonly cleanupFailedCreate: NonNullable<DaemonExecutionsOptions["cleanupFailedCreate"]>;
 
-  constructor(options: RelationshipOwnedExecutionsOptions) {
-    this.relationshipId = options.relationshipId;
+  constructor(options: DaemonExecutionsOptions) {
+    this.daemonId = options.daemonId;
     this.agentManager = options.agentManager;
     this.agentStorage = options.agentStorage;
     this.createAgentCommand = options.createAgent;
@@ -90,12 +87,12 @@ export class RelationshipOwnedExecutions implements HubExecutions {
     this.cleanupFailedCreate = options.cleanupFailedCreate ?? (async () => undefined);
   }
 
-  create(input: HubAgentCreateInput): Promise<OwnedAgentSnapshot> {
+  create(input: HubExecutionAgentCreateInput): Promise<OwnedAgentSnapshot> {
     if (!this.authorityActive) {
       return Promise.reject(new Error("Hub relationship authority is no longer active"));
     }
     const owner = this.owner(input.executionId);
-    const key = hubExecutionKey(owner);
+    const key = daemonExecutionKey(owner);
     const pending = this.pendingCreates.get(key);
     if (pending) {
       return pending;
@@ -109,14 +106,6 @@ export class RelationshipOwnedExecutions implements HubExecutions {
     });
     this.pendingCreates.set(key, create);
     return create;
-  }
-
-  async reconcile(executionId: string): Promise<OwnedAgentSnapshot | null> {
-    const owner = this.owner(executionId);
-    const pending = this.pendingCreates.get(hubExecutionKey(owner));
-    if (pending) return pending;
-    const record = await this.agentStorage.findByHubExecution(owner);
-    return record ? this.resolveRecord(record) : null;
   }
 
   async invalidateAuthority(): Promise<void> {
@@ -138,11 +127,11 @@ export class RelationshipOwnedExecutions implements HubExecutions {
   }
 
   private async createOrResolve(
-    owner: HubAgentOwner,
-    input: HubAgentCreateInput,
+    owner: DaemonAgentOwner,
+    input: HubExecutionAgentCreateInput,
     authorityGeneration: number,
   ): Promise<OwnedAgentSnapshot> {
-    const existing = await this.agentStorage.findByHubExecution(owner);
+    const existing = await this.agentStorage.findByDaemonExecution(owner);
     if (existing) {
       this.requireAuthority(authorityGeneration);
       return this.resolveRecord(existing);
@@ -269,18 +258,18 @@ export class RelationshipOwnedExecutions implements HubExecutions {
     };
   }
 
-  private isOwned(agent: ManagedAgent | null): agent is ManagedAgent & { owner: HubAgentOwner } {
-    return agent?.owner?.kind === "hub" && agent.owner.relationshipId === this.relationshipId;
+  private isOwned(agent: ManagedAgent | null): agent is ManagedAgent & { owner: DaemonAgentOwner } {
+    return agent?.owner?.kind === "daemon" && agent.owner.daemonId === this.daemonId;
   }
 
-  private owner(executionId: string): HubAgentOwner {
-    return { kind: "hub", relationshipId: this.relationshipId, executionId };
+  private owner(executionId: string): DaemonAgentOwner {
+    return { kind: "daemon", daemonId: this.daemonId, executionId };
   }
 
-  private requireOwner(record: StoredAgentRecord): HubAgentOwner {
+  private requireOwner(record: StoredAgentRecord): DaemonAgentOwner {
     const owner = record.owner;
-    if (owner?.kind !== "hub" || owner.relationshipId !== this.relationshipId) {
-      throw new Error(`Agent ${record.id} is not owned by Hub relationship ${this.relationshipId}`);
+    if (owner?.kind !== "daemon" || owner.daemonId !== this.daemonId) {
+      throw new Error(`Agent ${record.id} is not owned by daemon ${this.daemonId}`);
     }
     return owner;
   }

@@ -183,7 +183,7 @@ import {
   DirectHubRelationshipRemote,
   type HubRelationshipRemote,
 } from "./hub/relationship-remote.js";
-import { RelationshipOwnedExecutions } from "./hub/relationship-owned-executions.js";
+import { DaemonExecutions } from "./hub/daemon-executions.js";
 
 const MAX_MCP_DEBUG_BATCH_ITEMS = 10;
 const REDACTED_LOG_VALUE = "[redacted]";
@@ -1041,9 +1041,9 @@ export async function createPaseoDaemon(
       if (!wsServer) throw new Error("WebSocket server is not running");
       await wsServer.attachHubSocket(socket, options);
     },
-    createExecutions: (relationshipId) =>
-      new RelationshipOwnedExecutions({
-        relationshipId,
+    createExecutionAgents: (daemonId) =>
+      new DaemonExecutions({
+        daemonId,
         agentManager,
         agentStorage,
         createAgent,

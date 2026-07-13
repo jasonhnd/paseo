@@ -77,7 +77,7 @@ describe("DaemonSession", () => {
         },
         status: () => ({
           state: "not_connected",
-          relationshipId: null,
+          daemonId: null,
           hubOrigin: null,
           scopes: [],
           connectedAt: null,
@@ -90,13 +90,13 @@ describe("DaemonSession", () => {
     });
 
     await subsystem.handleHubRelationshipRequest({
-      type: "hub.relationship.connect.request",
+      type: "hub.management.daemon.connect.request",
       requestId: "connect-1",
       hubUrl: "https://hub.test",
       token: "token",
     });
     await subsystem.handleHubRelationshipRequest({
-      type: "hub.relationship.disconnect.request",
+      type: "hub.management.daemon.disconnect.request",
       requestId: "disconnect-1",
       force: false,
     });
@@ -106,7 +106,7 @@ describe("DaemonSession", () => {
         type: "rpc_error",
         payload: {
           requestId: "connect-1",
-          requestType: "hub.relationship.connect.request",
+          requestType: "hub.management.daemon.connect.request",
           error: "Hub rejected enrollment (401)",
           code: "handler_error",
         },
@@ -115,7 +115,7 @@ describe("DaemonSession", () => {
         type: "rpc_error",
         payload: {
           requestId: "disconnect-1",
-          requestType: "hub.relationship.disconnect.request",
+          requestType: "hub.management.daemon.disconnect.request",
           error: "Hub revocation failed (503)",
           code: "handler_error",
         },

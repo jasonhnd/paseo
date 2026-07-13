@@ -60,9 +60,9 @@ describe("Hub relationship", () => {
     const responses = await relationship.manageRelationshipFromExternalSocket();
 
     expect(responses.map((response) => response.type)).toEqual([
-      "hub.relationship.connect.response",
-      "hub.relationship.get_status.response",
-      "hub.relationship.disconnect.response",
+      "hub.management.daemon.connect.response",
+      "hub.management.daemon.get_status.response",
+      "hub.management.daemon.disconnect.response",
     ]);
     expect(relationship.enrollmentAttempts()).toHaveLength(1);
     expect(relationship.relationshipFile()).toBeNull();
@@ -73,7 +73,7 @@ describe("Hub relationship", () => {
 
     const response = await relationship.connectFromBrowserSocket();
 
-    expect(response.type).toBe("hub.relationship.connect.response");
+    expect(response.type).toBe("hub.management.daemon.connect.response");
     expect(relationship.enrollmentAttempts()).toHaveLength(1);
     expect(relationship.relationshipFile()?.state).toBe("active");
   });
@@ -90,7 +90,10 @@ describe("Hub relationship", () => {
     expect(pending).toMatchObject({
       record: {
         state: "pending",
-        relationship: { id: enrollment.relationshipId, idempotencyKey: enrollment.idempotencyKey },
+        relationship: {
+          daemonId: enrollment.daemonId,
+          idempotencyKey: enrollment.idempotencyKey,
+        },
         credential: { secret: expect.any(String) },
         enrollment: { token: "one-time-token" },
         identity: { serverId: expect.any(String), daemonPublicKey: expect.any(String) },
@@ -109,7 +112,7 @@ describe("Hub relationship", () => {
     await relationship.socketDialed();
     expect(relationship.socketInvocation()).toMatchObject({
       mode: privateFileMode,
-      record: { state: "active", relationship: { id: enrollment.relationshipId } },
+      record: { state: "active", relationship: { daemonId: enrollment.daemonId } },
     });
   });
 
@@ -235,7 +238,7 @@ describe("Hub relationship", () => {
           idempotencyKey: "ceremony-1",
           hubOrigin: "https://hub.test",
           createdAt: "2026-07-13T00:00:00.000Z",
-          scopes: ["hub.*"],
+          scopes: ["hub.execution.*"],
         },
         credential: { secret: "credential" },
         transport: { kind: "direct_websocket", webSocketUrl: "ftp://hub.test/daemon" },
@@ -261,7 +264,7 @@ describe("Hub relationship", () => {
           idempotencyKey: "ceremony-1",
           hubOrigin: "https://hub.test",
           createdAt: "2026-07-13T00:00:00.000Z",
-          scopes: ["hub.*"],
+          scopes: ["hub.execution.*"],
         },
         credential: { secret: "credential" },
         transport: {
@@ -299,7 +302,7 @@ describe("Hub relationship", () => {
     expect(relationship.revocationAttempts()).toBe(3);
     expect(relationship.latestRevocation()).toEqual(
       expect.objectContaining({
-        relationshipId: enrollment.relationshipId,
+        daemonId: enrollment.daemonId,
         hubOrigin: enrollment.hubOrigin,
         credential,
       }),
@@ -322,7 +325,7 @@ describe("Hub relationship", () => {
     const disconnected = await disconnecting.result;
 
     expect(disconnected.state).toBe("not_connected");
-    expect(relationship.latestRevocation()?.relationshipId).toBe(enrollment.relationshipId);
+    expect(relationship.latestRevocation()?.daemonId).toBe(enrollment.daemonId);
     expect(relationship.revocationAttempts()).toBe(1);
     expect(relationship.socketAttempts()).toBe(0);
     expect(relationship.relationshipFile()).toBeNull();
@@ -331,14 +334,14 @@ describe("Hub relationship", () => {
   test("daemon restart reconnects the same durable relationship", async () => {
     relationship = await HubRelationshipHarness.start();
     await relationship.beginConnect().result;
-    const id = relationship.relationshipFile()?.relationship.id;
+    const id = relationship.relationshipFile()?.relationship.daemonId;
     relationship.connectLatestSocket();
     await relationship.socketDialed();
 
     await relationship.restartDaemon();
     await relationship.socketDialed();
 
-    expect(relationship.relationshipFile()?.relationship.id).toBe(id);
+    expect(relationship.relationshipFile()?.relationship.daemonId).toBe(id);
     expect(relationship.socketAttempts()).toBe(2);
   });
 
@@ -347,7 +350,7 @@ describe("Hub relationship", () => {
     await relationship.beginConnect().result;
     await relationship.socketDialed();
     relationship.connectLatestSocket();
-    const relationshipId = relationship.relationshipFile()?.relationship.id;
+    const daemonId = relationship.relationshipFile()?.relationship.daemonId;
     const prompt = "sleep 30";
     relationship.beginOwnedCreate("running-create", "execution-running", {
       prompt,
@@ -359,14 +362,8 @@ describe("Hub relationship", () => {
     await relationship.restartDaemon();
     await relationship.socketDialed();
     relationship.connectLatestSocket();
-    const reconciled = await relationship.reconcileOwned("execution-running");
     relationship.beginOwnedCreate("running-duplicate", "execution-running", { prompt });
     const duplicate = await relationship.ownedCreateResult("running-duplicate");
-    expect(reconciled).toMatchObject({
-      executionId: "execution-running",
-      agentId: created.payload.agentId,
-      agent: { id: created.payload.agentId, status: "closed" },
-    });
     expect(duplicate).toMatchObject({
       payload: {
         success: true,
@@ -382,7 +379,7 @@ describe("Hub relationship", () => {
       agentId: created.payload.agentId,
       agent: { id: created.payload.agentId, status: "running" },
     });
-    expect(relationship.relationshipFile()?.relationship.id).toBe(relationshipId);
+    expect(relationship.relationshipFile()?.relationship.daemonId).toBe(daemonId);
     expect(durableAgentIds).toEqual([created.payload.agentId]);
     expect(relationship.providerCreations()).toBe(1);
     expect(relationship.providerResumes()).toBe(0);
@@ -413,7 +410,7 @@ describe("Hub relationship", () => {
     const duplicate = await relationship.ownedCreateResult("completed-duplicate");
 
     expect(duplicate).toMatchObject({
-      type: "hub.agent.create.response",
+      type: "hub.execution.agent.create.response",
       payload: {
         success: true,
         executionId: "execution-completed",
@@ -438,12 +435,15 @@ describe("Hub relationship", () => {
     await relationship.restartDaemon();
     await relationship.socketDialed();
     relationship.connectLatestSocket();
-    const reconciled = await relationship.reconcileOwned("execution-idle");
+    relationship.beginOwnedCreate("idle-retry", "execution-idle", { prompt });
+    const retried = await relationship.ownedCreateResult("idle-retry");
 
-    expect(reconciled).toMatchObject({
-      executionId: "execution-idle",
-      agentId: created.payload.agentId,
-      agent: { id: created.payload.agentId, status: "closed" },
+    expect(retried).toMatchObject({
+      payload: {
+        executionId: "execution-idle",
+        agentId: created.payload.agentId,
+        agent: { id: created.payload.agentId, status: "closed" },
+      },
     });
     expect(relationship.providerPromptTexts()).toEqual([prompt]);
     expect(relationship.providerResumes()).toBe(0);
@@ -462,17 +462,20 @@ describe("Hub relationship", () => {
     await relationship.restartDaemon();
     await relationship.socketDialed();
     relationship.connectLatestSocket();
-    const reconciled = await relationship.reconcileOwned("execution-failed");
+    relationship.beginOwnedCreate("failed-retry", "execution-failed", { prompt });
+    const retried = await relationship.ownedCreateResult("failed-retry");
 
     expect(failed).toMatchObject({
       executionId: "execution-failed",
       agentId: created.payload.agentId,
       event: { type: "turn_failed" },
     });
-    expect(reconciled).toMatchObject({
-      executionId: "execution-failed",
-      agentId: created.payload.agentId,
-      agent: { id: created.payload.agentId, status: "closed" },
+    expect(retried).toMatchObject({
+      payload: {
+        executionId: "execution-failed",
+        agentId: created.payload.agentId,
+        agent: { id: created.payload.agentId, status: "closed" },
+      },
     });
     expect(relationship.providerPromptTexts()).toEqual([prompt]);
     expect(relationship.providerResumes()).toBe(0);
@@ -506,11 +509,12 @@ describe("Hub relationship", () => {
     });
 
     expect(messages).toContainEqual({
-      type: "hub.authorization.denied",
+      type: "rpc_error",
       payload: {
         requestId: "still-current",
         requestType: "daemon.get_status.request",
-        code: "scope_denied",
+        error: "Session is not authorized for daemon.get_status.request",
+        code: "access_denied",
       },
     });
     expect(relationship.socketAttempts()).toBe(2);
@@ -535,7 +539,7 @@ describe("Hub relationship", () => {
 
     expect(relationship.socketDeliveredResponse(0, "first-create")).toBe(false);
     expect(replayed).toMatchObject({
-      type: "hub.agent.create.response",
+      type: "hub.execution.agent.create.response",
       payload: {
         success: true,
         executionId: "execution-race",
@@ -546,7 +550,7 @@ describe("Hub relationship", () => {
     expect(durableAgentIds).toHaveLength(1);
   });
 
-  test("reconcile waits for a pending create across socket generations", async () => {
+  test("idempotent retry waits for a pending create across socket generations", async () => {
     relationship = await HubRelationshipHarness.start();
     await relationship.beginConnect().result;
     relationship.connectLatestSocket();
@@ -557,13 +561,15 @@ describe("Hub relationship", () => {
     relationship.closeLatestSocket(1006);
     await relationship.retry();
     relationship.connectLatestSocket();
-    const reconciliation = relationship.reconcileOwned("pending-execution");
+    relationship.beginOwnedCreate("pending-retry", "pending-execution");
     relationship.finishAgentCreation();
 
-    await expect(reconciliation).resolves.toMatchObject({
-      executionId: "pending-execution",
-      agentId: expect.any(String),
-      agent: { id: expect.any(String) },
+    await expect(relationship.ownedCreateResult("pending-retry")).resolves.toMatchObject({
+      payload: {
+        executionId: "pending-execution",
+        agentId: expect.any(String),
+        agent: { id: expect.any(String) },
+      },
     });
     expect(relationship.providerCreations()).toBe(1);
     expect(await relationship.durableOwnedAgentIds()).toHaveLength(1);
@@ -606,16 +612,16 @@ describe("Hub relationship", () => {
 
     expect(status).toMatchObject({
       state: "revoked",
-      relationshipId: enrollment.relationshipId,
+      daemonId: enrollment.daemonId,
       hub: "https://hub.test",
-      scopes: "hub.*",
+      scopes: "hub.execution.*",
       error: reason,
     });
     expect(persisted?.state).toBe("revoked");
     expect(persisted?.relationship).toMatchObject({
-      id: enrollment.relationshipId,
+      daemonId: enrollment.daemonId,
       hubOrigin: "https://hub.test",
-      scopes: ["hub.*"],
+      scopes: ["hub.execution.*"],
     });
     expect(persisted?.reason).toBe(reason);
     expect(persisted).not.toHaveProperty("credential");

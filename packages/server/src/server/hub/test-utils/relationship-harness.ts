@@ -11,11 +11,10 @@ import pino from "pino";
 import { WebSocket } from "ws";
 import type {
   AgentSnapshotPayload,
-  HubAgentCreateResponse,
-  HubAgentStream,
-  HubAgentUpdate,
-  HubAuthorizationDenied,
-  HubExecutionReconcileResponse,
+  HubExecutionAgentCreateResponse,
+  HubExecutionAgentStream,
+  HubExecutionAgentUpdate,
+  RpcErrorMessage,
   CreateAgentWorktreeTarget,
   SessionOutboundMessage,
 } from "../../messages.js";
@@ -36,7 +35,7 @@ import { createTestAgentClients } from "../../test-utils/fake-agent-client.js";
 import { DaemonClient } from "../../test-utils/daemon-client.js";
 import { AgentStorage } from "../../agent/agent-storage.js";
 import { AgentManager } from "../../agent/agent-manager.js";
-import { RelationshipOwnedExecutions } from "../relationship-owned-executions.js";
+import { DaemonExecutions } from "../daemon-executions.js";
 import {
   createAgentCommand,
   type CreateAgentCommandDependencies,
@@ -114,7 +113,7 @@ interface PersistedRelationship {
   state: string;
   reason?: string;
   relationship: {
-    id: string;
+    daemonId: string;
     idempotencyKey?: string;
     hubOrigin: string;
     scopes: string[];
@@ -414,7 +413,11 @@ class InMemoryHubRelationships implements HubRelationshipRemote {
   }
 
   private enrollmentResult(input: HubEnrollment): HubEnrollmentResult {
-    return { relationshipId: input.relationshipId, scopes: ["hub.*"], webSocketUrl: SOCKET_URL };
+    return {
+      daemonId: input.daemonId,
+      scopes: ["hub.execution.*"],
+      webSocketUrl: SOCKET_URL,
+    };
   }
 }
 
@@ -422,7 +425,10 @@ interface CliProcess {
   result: Promise<Record<string, unknown>>;
 }
 
-type AcceptedCreate = Omit<HubAgentCreateResponse["payload"], "agentId" | "agent" | "success"> & {
+type AcceptedCreate = Omit<
+  HubExecutionAgentCreateResponse["payload"],
+  "agentId" | "agent" | "success"
+> & {
   agentId: string;
   agent: AgentSnapshotPayload;
   success: true;
@@ -450,7 +456,6 @@ export class HubRelationshipHarness {
   private failNextSessionClose = false;
   private observedEnrollments = 0;
   private observedSockets = 0;
-  private reconcileRequests = 0;
   private readonly codex = new ControlledAgentClient(
     createTestAgentClients({
       closeSession: async () => {
@@ -523,14 +528,14 @@ export class HubRelationshipHarness {
     const socket = await this.openClaimedCliSocket(`ws://${address}:${target.port}/ws`);
     const messages = [
       {
-        type: "hub.relationship.connect.request",
+        type: "hub.management.daemon.connect.request",
         requestId: "external-hub-connect",
         hubUrl: HUB_ORIGIN,
         token: "external-token",
       },
-      { type: "hub.relationship.get_status.request", requestId: "external-hub-status" },
+      { type: "hub.management.daemon.get_status.request", requestId: "external-hub-status" },
       {
-        type: "hub.relationship.disconnect.request",
+        type: "hub.management.daemon.disconnect.request",
         requestId: "external-hub-disconnect",
         force: false,
       },
@@ -554,7 +559,7 @@ export class HubRelationshipHarness {
       JSON.stringify({
         type: "session",
         message: {
-          type: "hub.relationship.connect.request",
+          type: "hub.management.daemon.connect.request",
           requestId: "browser-hub-connect",
           hubUrl: HUB_ORIGIN,
           token: "browser-token",
@@ -664,7 +669,7 @@ export class HubRelationshipHarness {
   ): void {
     const { prompt = "Create through the Hub", ...requestOptions } = options;
     this.latestSocket().socket.receive({
-      type: "hub.agent.create.request",
+      type: "hub.execution.agent.create.request",
       requestId,
       executionId,
       provider: "codex",
@@ -689,13 +694,13 @@ export class HubRelationshipHarness {
 
   async durableOwnedAgentIds(): Promise<string[]> {
     return (await this.daemon!.agentStorage.list())
-      .filter((record) => record.owner?.kind === "hub")
+      .filter((record) => record.owner?.kind === "daemon")
       .map((record) => record.id);
   }
 
   activeOwnedAgentIds(): string[] {
     return this.daemon!.agentManager.listAgents()
-      .filter((agent) => agent.owner?.kind === "hub")
+      .filter((agent) => agent.owner?.kind === "daemon")
       .map((agent) => agent.id);
   }
 
@@ -836,8 +841,8 @@ export class HubRelationshipHarness {
 
   async ownedPermissionRequest(agentId: string) {
     const message = await this.latestSocket().socket.messageMatching(
-      (candidate): candidate is HubAgentStream =>
-        candidate.type === "hub.agent.stream" &&
+      (candidate): candidate is HubExecutionAgentStream =>
+        candidate.type === "hub.execution.agent.stream" &&
         candidate.payload.agentId === agentId &&
         candidate.payload.event.type === "permission_requested",
     );
@@ -876,39 +881,39 @@ export class HubRelationshipHarness {
     return { first, duplicate };
   }
 
-  async ownedUpdate(agentId: string): Promise<HubAgentUpdate["payload"]> {
+  async ownedUpdate(agentId: string): Promise<HubExecutionAgentUpdate["payload"]> {
     const message = await this.latestSocket().socket.messageMatching(
-      (candidate): candidate is HubAgentUpdate =>
-        candidate.type === "hub.agent.update" && candidate.payload.agentId === agentId,
+      (candidate): candidate is HubExecutionAgentUpdate =>
+        candidate.type === "hub.execution.agent.update" && candidate.payload.agentId === agentId,
     );
     return message.payload;
   }
 
-  async ownedRunningUpdate(agentId: string): Promise<HubAgentUpdate["payload"]> {
+  async ownedRunningUpdate(agentId: string): Promise<HubExecutionAgentUpdate["payload"]> {
     const message = await this.latestSocket().socket.messageMatching(
-      (candidate): candidate is HubAgentUpdate =>
-        candidate.type === "hub.agent.update" &&
+      (candidate): candidate is HubExecutionAgentUpdate =>
+        candidate.type === "hub.execution.agent.update" &&
         candidate.payload.agentId === agentId &&
         candidate.payload.agent.status === "running",
     );
     return message.payload;
   }
 
-  async ownedTurnCompletion(agentId: string): Promise<HubAgentStream["payload"]> {
+  async ownedTurnCompletion(agentId: string): Promise<HubExecutionAgentStream["payload"]> {
     const socket = this.latestSocket().socket;
     const completed = await socket.messageMatching(
-      (candidate): candidate is HubAgentStream =>
-        candidate.type === "hub.agent.stream" &&
+      (candidate): candidate is HubExecutionAgentStream =>
+        candidate.type === "hub.execution.agent.stream" &&
         candidate.payload.agentId === agentId &&
         candidate.payload.event.type === "turn_completed",
     );
     return completed.payload;
   }
 
-  async ownedTurnFailure(agentId: string): Promise<HubAgentStream["payload"]> {
+  async ownedTurnFailure(agentId: string): Promise<HubExecutionAgentStream["payload"]> {
     const failed = await this.latestSocket().socket.messageMatching(
-      (candidate): candidate is HubAgentStream =>
-        candidate.type === "hub.agent.stream" &&
+      (candidate): candidate is HubExecutionAgentStream =>
+        candidate.type === "hub.execution.agent.stream" &&
         candidate.payload.agentId === agentId &&
         candidate.payload.event.type === "turn_failed",
     );
@@ -918,32 +923,18 @@ export class HubRelationshipHarness {
   latestOwnedTurnCompletions(agentId: string): number {
     return this.latestSocket().socket.sent.filter(
       (message) =>
-        message.type === "hub.agent.stream" &&
+        message.type === "hub.execution.agent.stream" &&
         message.payload.agentId === agentId &&
         message.payload.event.type === "turn_completed",
     ).length;
   }
 
-  async ownedStream(agentId: string): Promise<HubAgentStream["payload"]> {
+  async ownedStream(agentId: string): Promise<HubExecutionAgentStream["payload"]> {
     const message = await this.latestSocket().socket.messageMatching(
-      (candidate): candidate is HubAgentStream =>
-        candidate.type === "hub.agent.stream" && candidate.payload.agentId === agentId,
+      (candidate): candidate is HubExecutionAgentStream =>
+        candidate.type === "hub.execution.agent.stream" && candidate.payload.agentId === agentId,
     );
     return message.payload;
-  }
-
-  async reconcileOwned(
-    executionId = "execution-1",
-  ): Promise<HubExecutionReconcileResponse["payload"]> {
-    const requestId = `reconcile-${executionId}-${++this.reconcileRequests}`;
-    this.latestSocket().socket.receive({
-      type: "hub.execution.reconcile.request",
-      requestId,
-      executionId,
-    });
-    return (
-      (await this.latestSocket().socket.messageFor(requestId)) as HubExecutionReconcileResponse
-    ).payload;
   }
 
   async createUnrelatedLocalAgent(): Promise<string> {
@@ -955,7 +946,7 @@ export class HubRelationshipHarness {
     return agent.id;
   }
 
-  async deniedSteering(agentId: string): Promise<HubAuthorizationDenied["payload"]> {
+  async deniedSteering(agentId: string): Promise<RpcErrorMessage["payload"]> {
     const requestId = "denied-steer";
     this.latestSocket().socket.receive({
       type: "send_agent_message_request",
@@ -963,11 +954,10 @@ export class HubRelationshipHarness {
       agentId,
       text: "This must not run",
     });
-    return ((await this.latestSocket().socket.messageFor(requestId)) as HubAuthorizationDenied)
-      .payload;
+    return ((await this.latestSocket().socket.messageFor(requestId)) as RpcErrorMessage).payload;
   }
 
-  async deniedBrowserDispatch(): Promise<HubAuthorizationDenied["payload"]> {
+  async deniedBrowserDispatch(): Promise<RpcErrorMessage["payload"]> {
     const requestId = "browser-1";
     this.latestSocket().socket.receive({
       type: "browser.automation.execute.response",
@@ -977,15 +967,14 @@ export class HubRelationshipHarness {
         error: { code: "browser_denied", message: "denied", retryable: false },
       },
     });
-    return ((await this.latestSocket().socket.messageFor(requestId)) as HubAuthorizationDenied)
-      .payload;
+    return ((await this.latestSocket().socket.messageFor(requestId)) as RpcErrorMessage).payload;
   }
 
   observedAgentIds(): string[] {
     return this.remote.sockets.flatMap(({ socket }) =>
       socket.sent.flatMap((message) => {
-        if (message.type === "hub.agent.update") return [message.payload.agentId];
-        if (message.type === "hub.agent.stream") return [message.payload.agentId];
+        if (message.type === "hub.execution.agent.update") return [message.payload.agentId];
+        if (message.type === "hub.execution.agent.stream") return [message.payload.agentId];
         return [];
       }),
     );
@@ -1022,7 +1011,8 @@ export class HubRelationshipHarness {
     const client = await this.trustedClient();
     try {
       await client.patchDaemonConfig({ appendSystemPrompt: "hub-broadcast-isolation" });
-      await this.reconcileOwned("broadcast-barrier");
+      this.beginOwnedCreate("broadcast-barrier", "broadcast-barrier");
+      await this.acceptedCreate("broadcast-barrier");
       return this.daemonConfigBroadcasts() - before;
     } finally {
       await client.close();
@@ -1038,11 +1028,12 @@ export class HubRelationshipHarness {
     }
   }
 
-  async reconnectAndReconcile(executionId = "execution-1") {
+  async reconnectAndRetry(executionId = "execution-1") {
     this.closeLatestSocket(1006);
     await this.retry();
     this.connectLatestSocket();
-    return this.reconcileOwned(executionId);
+    this.beginOwnedCreate("reconnect-retry", executionId);
+    return this.acceptedCreate("reconnect-retry");
   }
 
   async reconstructAndReplay(executionId = "execution-1") {
@@ -1057,30 +1048,20 @@ export class HubRelationshipHarness {
     });
     const executions = this.executionsForReconstruction(manager, storage);
     const replay = await executions.create(this.ownedCreateInput(executionId));
-    const reconciliation = await executions.reconcile(executionId);
     const durableAgentCount = (await storage.list()).filter(
-      (record) => record.owner?.kind === "hub",
+      (record) => record.owner?.kind === "daemon",
     ).length;
-    return { replay, reconciliation, durableAgentCount };
+    return { replay, durableAgentCount };
   }
 
-  async removeAndReconcile(agentId: string, executionId = "execution-1") {
+  async removeOwnedAgent(agentId: string) {
     await this.daemon!.agentStorage.remove(agentId);
     const storage = new AgentStorage(
       path.join(this.paseoHome, "agents"),
       pino({ level: "silent" }),
     );
-    const manager = new AgentManager({
-      clients: createTestAgentClients(),
-      registry: storage,
-      logger: pino({ level: "silent" }),
-    });
-    const reconciliation = await this.executionsForReconstruction(manager, storage).reconcile(
-      executionId,
-    );
     return {
-      reconciliation,
-      durableAgentCount: (await storage.list()).filter((record) => record.owner?.kind === "hub")
+      durableAgentCount: (await storage.list()).filter((record) => record.owner?.kind === "daemon")
         .length,
     };
   }
@@ -1343,7 +1324,7 @@ export class HubRelationshipHarness {
   private async acceptedCreate(requestId: string): Promise<AcceptedCreate> {
     const message = (await this.latestSocket().socket.messageFor(
       requestId,
-    )) as HubAgentCreateResponse;
+    )) as HubExecutionAgentCreateResponse;
     if (!message.payload.success || !message.payload.agentId || !message.payload.agent) {
       throw new Error(message.payload.error ?? "Hub agent creation failed");
     }
@@ -1366,8 +1347,8 @@ export class HubRelationshipHarness {
   }
 
   private executionsForReconstruction(manager: AgentManager, storage: AgentStorage) {
-    return new RelationshipOwnedExecutions({
-      relationshipId: this.relationshipFile()!.relationship.id,
+    return new DaemonExecutions({
+      daemonId: this.relationshipFile()!.relationship.daemonId,
       agentManager: manager,
       agentStorage: storage,
       createAgent: (input) =>

@@ -6,7 +6,7 @@ import path from "node:path";
 import pino from "pino";
 import { afterEach, expect, test } from "vitest";
 import { WebSocket } from "ws";
-import type { HubExecutions } from "./relationship-owned-executions.js";
+import type { HubExecutionAgents } from "./daemon-executions.js";
 import {
   HubRelationshipController,
   type HubRelationshipClock,
@@ -37,7 +37,7 @@ test.each([401, 403, 404])(
     const remote = new DirectHubRelationshipRemote();
 
     await expect(
-      remote.revoke({ relationshipId: "relationship-1", hubOrigin, credential: "invalid" }),
+      remote.revoke({ daemonId: "daemon-1", hubOrigin, credential: "invalid" }),
     ).resolves.toBeUndefined();
   },
 );
@@ -47,7 +47,7 @@ test("transient revocation failures remain retryable", async () => {
   const remote = new DirectHubRelationshipRemote();
 
   await expect(
-    remote.revoke({ relationshipId: "relationship-1", hubOrigin, credential: "credential" }),
+    remote.revoke({ daemonId: "daemon-1", hubOrigin, credential: "credential" }),
   ).rejects.toThrow("Hub revocation failed (503)");
 });
 
@@ -57,14 +57,14 @@ test.each([408, 429])("transient enrollment status %s remains retryable", async 
 
   const error = await remote
     .enroll({
-      relationshipId: "relationship-1",
+      daemonId: "daemon-1",
       idempotencyKey: "ceremony-1",
       hubOrigin,
       token: "token",
       serverId: "server-1",
       daemonPublicKey: "public-key",
       credentialVerifier: "verifier",
-      scopes: ["hub.*"],
+      scopes: ["hub.execution.*"],
     })
     .catch((caught: unknown) => caught);
 
@@ -79,14 +79,14 @@ test("enrollment rejects a transport URL that cannot open a WebSocket", async ()
 
   await expect(
     remote.enroll({
-      relationshipId: "relationship-1",
+      daemonId: "daemon-1",
       idempotencyKey: "ceremony-1",
       hubOrigin,
       token: "token",
       serverId: "server-1",
       daemonPublicKey: "public-key",
       credentialVerifier: "verifier",
-      scopes: ["hub.*"],
+      scopes: ["hub.execution.*"],
     }),
   ).rejects.toThrow("Hub WebSocket URL must use ws or wss");
 });
@@ -97,14 +97,14 @@ test("enrollment rejects a WebSocket URL with a fragment", async () => {
 
   await expect(
     remote.enroll({
-      relationshipId: "relationship-1",
+      daemonId: "daemon-1",
       idempotencyKey: "ceremony-1",
       hubOrigin,
       token: "token",
       serverId: "server-1",
       daemonPublicKey: "public-key",
       credentialVerifier: "verifier",
-      scopes: ["hub.*"],
+      scopes: ["hub.execution.*"],
     }),
   ).rejects.toThrow("Hub WebSocket URL cannot include a fragment");
 });
@@ -115,14 +115,14 @@ test("enrollment rejects a WebSocket outside the enrolled Hub authority", async 
 
   await expect(
     remote.enroll({
-      relationshipId: "relationship-1",
+      daemonId: "daemon-1",
       idempotencyKey: "ceremony-1",
       hubOrigin,
       token: "token",
       serverId: "server-1",
       daemonPublicKey: "public-key",
       credentialVerifier: "verifier",
-      scopes: ["hub.*"],
+      scopes: ["hub.execution.*"],
     }),
   ).rejects.toThrow("Hub WebSocket URL must match the Hub origin");
 });
@@ -134,17 +134,17 @@ test.each(["enrollment", "revocation"])("%s HTTP calls are bounded", async (oper
   const request =
     operation === "enrollment"
       ? remote.enroll({
-          relationshipId: "relationship-1",
+          daemonId: "daemon-1",
           idempotencyKey: "ceremony-1",
           hubOrigin,
           token: "token",
           serverId: "server-1",
           daemonPublicKey: "public-key",
           credentialVerifier: "verifier",
-          scopes: ["hub.*"],
+          scopes: ["hub.execution.*"],
         })
       : remote.revoke({
-          relationshipId: "relationship-1",
+          daemonId: "daemon-1",
           hubOrigin,
           credential: "credential",
         });
@@ -161,7 +161,7 @@ test.each([401, 403] as const)(
 
     const socket = remote.openSocket(
       {
-        relationshipId: "relationship-1",
+        daemonId: "daemon-1",
         webSocketUrl: hub.webSocketUrl,
         credential: "invalid",
       },
@@ -183,7 +183,7 @@ test("a transient socket response releases the failed upgrade and reports one co
 
   const socket = remote.openSocket(
     {
-      relationshipId: "relationship-1",
+      daemonId: "daemon-1",
       webSocketUrl: hub.webSocketUrl,
       credential: "credential",
     },
@@ -204,7 +204,7 @@ test("a stalled socket opening handshake times out and releases the connection",
 
   const socket = remote.openSocket(
     {
-      relationshipId: "relationship-1",
+      daemonId: "daemon-1",
       webSocketUrl: hub.webSocketUrl,
       credential: "credential",
     },
@@ -294,11 +294,11 @@ async function startEnrollmentHub(webSocketUrl: string): Promise<string> {
   const server = createServer(async (request, response) => {
     let body = "";
     for await (const chunk of request) body += chunk;
-    const enrollment = JSON.parse(body) as { relationshipId: string };
+    const enrollment = JSON.parse(body) as { daemonId: string };
     response.writeHead(200, { "content-type": "application/json" }).end(
       JSON.stringify({
-        relationshipId: enrollment.relationshipId,
-        scopes: ["hub.*"],
+        daemonId: enrollment.daemonId,
+        scopes: ["hub.execution.*"],
         webSocketUrl,
       }),
     );
@@ -385,11 +385,11 @@ class UpgradeRejectingHub {
   private readonly server = createServer(async (request, response) => {
     let body = "";
     for await (const chunk of request) body += chunk;
-    const enrollment = JSON.parse(body) as { relationshipId: string };
+    const enrollment = JSON.parse(body) as { daemonId: string };
     response.writeHead(200, { "content-type": "application/json" }).end(
       JSON.stringify({
-        relationshipId: enrollment.relationshipId,
-        scopes: ["hub.*"],
+        daemonId: enrollment.daemonId,
+        scopes: ["hub.execution.*"],
         webSocketUrl: this.webSocketUrl,
       }),
     );
@@ -507,11 +507,10 @@ class ManualRelationshipClock implements HubRelationshipClock, HubRelationshipRe
   }
 }
 
-const unusedExecutions: HubExecutions = {
+const unusedExecutionAgents: HubExecutionAgents = {
   create: async () => {
     throw new Error("Unexpected Hub agent create");
   },
-  reconcile: async () => null,
   subscribe: () => () => undefined,
   invalidateAuthority: async () => undefined,
 };
@@ -531,7 +530,7 @@ async function connectController(
     clock,
     retryPolicy: clock,
     attachSocket: async () => undefined,
-    createExecutions: () => unusedExecutions,
+    createExecutionAgents: () => unusedExecutionAgents,
   });
   await controller.connect({ hubUrl: hub.origin, token: "enrollment-token" });
   return controller;

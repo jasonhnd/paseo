@@ -3955,8 +3955,8 @@ export class DaemonClient {
     this.requireHubRelationshipSupport();
     return this.sendCorrelatedSessionRequest({
       requestId,
-      message: { type: "hub.relationship.connect.request", hubUrl, token },
-      responseType: "hub.relationship.connect.response",
+      message: { type: "hub.management.daemon.connect.request", hubUrl, token },
+      responseType: "hub.management.daemon.connect.response",
     });
   }
 
@@ -3964,8 +3964,8 @@ export class DaemonClient {
     this.requireHubRelationshipSupport();
     return this.sendCorrelatedSessionRequest({
       requestId,
-      message: { type: "hub.relationship.get_status.request" },
-      responseType: "hub.relationship.get_status.response",
+      message: { type: "hub.management.daemon.get_status.request" },
+      responseType: "hub.management.daemon.get_status.response",
     });
   }
 
@@ -3973,8 +3973,8 @@ export class DaemonClient {
     this.requireHubRelationshipSupport();
     return this.sendCorrelatedSessionRequest({
       requestId,
-      message: { type: "hub.relationship.disconnect.request", force },
-      responseType: "hub.relationship.disconnect.response",
+      message: { type: "hub.management.daemon.disconnect.request", force },
+      responseType: "hub.management.daemon.disconnect.response",
     });
   }
 

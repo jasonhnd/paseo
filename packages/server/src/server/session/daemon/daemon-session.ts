@@ -101,35 +101,35 @@ export class DaemonSession {
       SessionInboundMessage,
       {
         type:
-          | "hub.relationship.connect.request"
-          | "hub.relationship.get_status.request"
-          | "hub.relationship.disconnect.request";
+          | "hub.management.daemon.connect.request"
+          | "hub.management.daemon.get_status.request"
+          | "hub.management.daemon.disconnect.request";
       }
     >,
   ): Promise<void> {
     try {
       if (!this.hubRelationships) throw new Error("Hub relationship management is unavailable");
-      if (msg.type === "hub.relationship.connect.request") {
+      if (msg.type === "hub.management.daemon.connect.request") {
         const status = await this.hubRelationships.connect({
           hubUrl: msg.hubUrl,
           token: msg.token,
         });
         this.host.emit({
-          type: "hub.relationship.connect.response",
+          type: "hub.management.daemon.connect.response",
           payload: { requestId: msg.requestId, status },
         });
         return;
       }
-      if (msg.type === "hub.relationship.disconnect.request") {
+      if (msg.type === "hub.management.daemon.disconnect.request") {
         const result = await this.hubRelationships.disconnect({ force: msg.force ?? false });
         this.host.emit({
-          type: "hub.relationship.disconnect.response",
+          type: "hub.management.daemon.disconnect.response",
           payload: { requestId: msg.requestId, ...result },
         });
         return;
       }
       this.host.emit({
-        type: "hub.relationship.get_status.response",
+        type: "hub.management.daemon.get_status.response",
         payload: { requestId: msg.requestId, status: this.hubRelationships.status() },
       });
     } catch (error) {

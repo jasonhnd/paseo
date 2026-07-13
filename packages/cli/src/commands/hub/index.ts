@@ -5,7 +5,7 @@ import { connectToDaemon } from "../../utils/client.js";
 
 interface HubRow {
   state: string;
-  relationshipId: string | null;
+  daemonId: string | null;
   hub: string | null;
   scopes: string;
   connectedAt: string | null;
@@ -18,7 +18,7 @@ const schema: OutputSchema<HubRow> = {
   columns: [
     { header: "STATE", field: "state" },
     { header: "HUB", field: "hub" },
-    { header: "RELATIONSHIP", field: "relationshipId" },
+    { header: "DAEMON", field: "daemonId" },
     { header: "SCOPES", field: "scopes" },
     { header: "CONNECTED", field: "connectedAt" },
     { header: "ERROR", field: "error" },
@@ -29,7 +29,7 @@ const schema: OutputSchema<HubRow> = {
 function result(
   status: {
     state: string;
-    relationshipId: string | null;
+    daemonId: string | null;
     hubOrigin: string | null;
     scopes: string[];
     connectedAt: string | null;
@@ -42,7 +42,7 @@ function result(
     data: [
       {
         state: status.state,
-        relationshipId: status.relationshipId,
+        daemonId: status.daemonId,
         hub: status.hubOrigin,
         scopes: status.scopes.join(", "),
         connectedAt: status.connectedAt,

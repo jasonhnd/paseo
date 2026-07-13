@@ -19,13 +19,12 @@ async function launchRelationship(): Promise<HubRelationshipHarness> {
   return launched;
 }
 
-test("Hub owns one durable execution across concurrency and reconstruction", async () => {
+test("Hub retries one durable daemon execution across concurrency and reconstruction", async () => {
   const hub = await launchRelationship();
 
   const created = await hub.createOwnedConcurrently();
   const update = await hub.ownedUpdate(created.first.agentId);
   const stream = await hub.ownedStream(created.first.agentId);
-  const reconciled = await hub.reconcileOwned();
   const reconstructed = await hub.reconstructAndReplay();
 
   expect(created.duplicate.agentId).toBe(created.first.agentId);
@@ -35,13 +34,7 @@ test("Hub owns one durable execution across concurrency and reconstruction", asy
     agent: { id: created.first.agentId },
   });
   expect(stream).toMatchObject({ executionId: "execution-1", agentId: created.first.agentId });
-  expect(reconciled).toMatchObject({
-    executionId: "execution-1",
-    agentId: created.first.agentId,
-    agent: { id: created.first.agentId },
-  });
   expect(reconstructed.replay.agent.id).toBe(created.first.agentId);
-  expect(reconstructed.reconciliation?.agent.id).toBe(created.first.agentId);
   expect(reconstructed.durableAgentCount).toBe(1);
 });
 
@@ -55,12 +48,14 @@ test("Hub denies trusted steering and browser dispatch", async () => {
   expect(steeringDenial).toEqual({
     requestId: "denied-steer",
     requestType: "send_agent_message_request",
-    code: "scope_denied",
+    error: "Session is not authorized for send_agent_message_request",
+    code: "access_denied",
   });
   expect(browserDenial).toEqual({
     requestId: "browser-1",
     requestType: "browser.automation.execute.response",
-    code: "scope_denied",
+    error: "Session is not authorized for browser.automation.execute.response",
+    code: "access_denied",
   });
   expect(hub.observedAgentIds()).not.toContain(localAgentId);
   expect(hub.observedTrustedLifecycleMessages()).toEqual([]);
@@ -93,7 +88,7 @@ test("Hub reconnects without retaining trusted session state", async () => {
   const hub = await launchRelationship();
   const created = await hub.createOwnedConcurrently();
 
-  const reconnected = await hub.reconnectAndReconcile();
+  const reconnected = await hub.reconnectAndRetry();
 
   expect(reconnected).toMatchObject({
     executionId: "execution-1",
@@ -121,7 +116,7 @@ test("Hub create forwards worktree and auto-archive through the existing create 
   const afterArchive = await hub.worktreeState(worktreeCwd!);
 
   expect(worktreeCreated).toMatchObject({
-    type: "hub.agent.create.response",
+    type: "hub.execution.agent.create.response",
     payload: { success: true, agent: { cwd: worktreeCwd } },
   });
   expect(worktreeCwd).not.toBe(hub.repoRoot());

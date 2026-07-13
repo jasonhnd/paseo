@@ -17,6 +17,7 @@ import type { CheckoutDiffManager, CheckoutDiffMetrics } from "./checkout-diff-m
 import type { DaemonConfigStore, MutableDaemonConfig } from "./daemon-config-store.js";
 import {
   type ServerInfoStatusPayload,
+  type SessionOutboundMessage,
   type WorkspaceSetupSnapshot,
   type WSHelloMessage,
   type WSInboundMessage,
@@ -31,9 +32,8 @@ import type { TerminalActivity } from "@getpaseo/protocol/terminal-activity";
 import type { HostnamesConfig } from "./hostnames.js";
 import { isHostnameAllowed } from "./hostnames.js";
 import { Session, type SessionLifecycleIntent, type SessionRuntimeMetrics } from "./session.js";
-import { HubSession } from "./hub/hub-session.js";
 import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
-import type { HubExecutions } from "./hub/relationship-owned-executions.js";
+import type { HubExecutionAgents } from "./hub/daemon-executions.js";
 import type { AgentProvider } from "./agent/agent-sdk-types.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type { WorkspaceGitRuntimeSnapshot, WorkspaceGitService } from "./workspace-git-service.js";
@@ -347,15 +347,15 @@ interface TrustedSessionConnection {
   externalDisconnectCleanupTimeout: ReturnType<typeof setTimeout> | null;
 }
 
-interface HubSessionConnection {
+interface HubConnection {
   kind: "hub";
-  session: HubSession;
-  relationshipId: string;
+  session: Session;
+  daemonId: string;
   connectionLogger: pino.Logger;
   socket: WebSocketLike;
 }
 
-type SessionConnection = TrustedSessionConnection | HubSessionConnection;
+type SessionConnection = TrustedSessionConnection | HubConnection;
 
 type TrustedLifecycleKey =
   | "clientId"
@@ -363,14 +363,27 @@ type TrustedLifecycleKey =
   | "clientCapabilities"
   | "sockets"
   | "externalDisconnectCleanupTimeout";
-type HubTrustedLifecycleOverlap = Extract<keyof HubSessionConnection, TrustedLifecycleKey>;
-const HUB_HAS_NO_TRUSTED_LIFECYCLE_STATE: HubTrustedLifecycleOverlap extends never ? true : never =
-  true;
+type HubLifecycleOverlap = Extract<keyof HubConnection, TrustedLifecycleKey>;
+const HUB_HAS_NO_TRUSTED_LIFECYCLE_STATE: HubLifecycleOverlap extends never ? true : never = true;
 void HUB_HAS_NO_TRUSTED_LIFECYCLE_STATE;
 
 interface BrowserToolsRegistration {
   capabilitySignature: string;
   unregister: () => void;
+}
+
+interface SocketSessionOptions {
+  clientId: string;
+  appVersion: string | null;
+  clientCapabilities: Record<string, unknown> | null;
+  grants: readonly string[];
+  connectionLogger: pino.Logger;
+  onMessage: (message: SessionOutboundMessage) => void;
+  onBinaryMessage?: (frame: Uint8Array) => void;
+  getTransportBufferedAmount?: () => number | null;
+  onLifecycleIntent?: (intent: SessionLifecycleIntent) => void;
+  hubExecutionAgents?: HubExecutionAgents;
+  hubRelationships?: HubRelationshipManagement;
 }
 
 const SLOW_REQUEST_THRESHOLD_MS = 500;
@@ -845,8 +858,9 @@ export class VoiceAssistantWebSocketServer {
   public async attachHubSocket(
     ws: WebSocketLike,
     options: {
-      relationshipId: string;
-      executions: HubExecutions;
+      daemonId: string;
+      grants: readonly string[];
+      agents: HubExecutionAgents;
     },
   ): Promise<void> {
     if (!this.acceptingConnections) {
@@ -856,16 +870,21 @@ export class VoiceAssistantWebSocketServer {
 
     const connectionLogger = this.logger.child({
       connectionKind: "hub",
-      relationshipId: options.relationshipId,
+      daemonId: options.daemonId,
     });
-    const session = new HubSession({
-      executions: options.executions,
-      send: (message) => this.sendToClient(ws, wrapSessionMessage(message)),
+    const session = this.createSocketSession({
+      clientId: `hub:${options.daemonId}`,
+      appVersion: null,
+      clientCapabilities: null,
+      grants: options.grants,
+      connectionLogger,
+      onMessage: (message) => this.sendToClient(ws, wrapSessionMessage(message)),
+      hubExecutionAgents: options.agents,
     });
-    const connection: HubSessionConnection = {
+    const connection: HubConnection = {
       kind: "hub",
       session,
-      relationshipId: options.relationshipId,
+      daemonId: options.daemonId,
       connectionLogger,
       socket: ws,
     };
@@ -1067,10 +1086,12 @@ export class VoiceAssistantWebSocketServer {
     const { ws, clientId, appVersion, clientCapabilities, connectionLogger } = params;
     let connection: TrustedSessionConnection | null = null;
 
-    const session = new Session({
+    const session = this.createSocketSession({
       clientId,
       appVersion,
       clientCapabilities,
+      grants: ["*"],
+      connectionLogger,
       onMessage: (msg) => {
         if (!connection) {
           return;
@@ -1102,7 +1123,33 @@ export class VoiceAssistantWebSocketServer {
       onLifecycleIntent: (intent) => {
         this.onLifecycleIntent?.(intent);
       },
-      logger: connectionLogger.child({ module: "session" }),
+      hubRelationships: this.hubRelationships ?? undefined,
+    });
+
+    connection = {
+      kind: "trusted",
+      session,
+      clientId,
+      appVersion,
+      clientCapabilities,
+      connectionLogger,
+      sockets: new Set([ws]),
+      externalDisconnectCleanupTimeout: null,
+    };
+    return connection;
+  }
+
+  private createSocketSession(options: SocketSessionOptions): Session {
+    return new Session({
+      clientId: options.clientId,
+      appVersion: options.appVersion,
+      clientCapabilities: options.clientCapabilities,
+      grants: options.grants,
+      onMessage: options.onMessage,
+      onBinaryMessage: options.onBinaryMessage,
+      getTransportBufferedAmount: options.getTransportBufferedAmount,
+      onLifecycleIntent: options.onLifecycleIntent,
+      logger: options.connectionLogger.child({ module: "session" }),
       downloadTokenStore: this.downloadTokenStore,
       pushTokenStore: this.pushTokenStore,
       paseoHome: this.paseoHome,
@@ -1126,6 +1173,8 @@ export class VoiceAssistantWebSocketServer {
       terminalManager: this.terminalManager,
       providerSnapshotManager: this.providerSnapshotManager,
       providerUsageService: this.providerUsageService,
+      hubExecutionAgents: options.hubExecutionAgents,
+      hubRelationships: options.hubRelationships,
       serviceProxy: this.serviceProxy ?? undefined,
       scriptRuntimeStore: this.scriptRuntimeStore ?? undefined,
       workspaceSetupSnapshots: this.workspaceSetupSnapshots,
@@ -1164,20 +1213,7 @@ export class VoiceAssistantWebSocketServer {
       daemonVersion: this.daemonVersion,
       daemonRuntimeConfig: this.daemonRuntimeConfig,
       getWebSocketRuntimeMetrics: () => this.lastRuntimeMetricsSnapshot,
-      hubRelationships: this.hubRelationships ?? undefined,
     });
-
-    connection = {
-      kind: "trusted",
-      session,
-      clientId,
-      appVersion,
-      clientCapabilities,
-      connectionLogger,
-      sockets: new Set([ws]),
-      externalDisconnectCleanupTimeout: null,
-    };
-    return connection;
   }
 
   private clearPendingConnection(ws: WebSocketLike): PendingConnection | null {
@@ -1825,7 +1861,7 @@ export class VoiceAssistantWebSocketServer {
       } else if (activeConnection.kind === "trusted") {
         connectionFields = { clientId: activeConnection.clientId };
       } else {
-        connectionFields = { relationshipId: activeConnection.relationshipId };
+        connectionFields = { daemonId: activeConnection.daemonId };
       }
       activeConnection.connectionLogger.warn(
         {

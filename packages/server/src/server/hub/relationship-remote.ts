@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { WebSocketLike } from "../websocket-server.js";
 
 export interface HubEnrollment {
-  relationshipId: string;
+  daemonId: string;
   idempotencyKey: string;
   hubOrigin: string;
   token: string;
@@ -14,19 +14,19 @@ export interface HubEnrollment {
 }
 
 export interface HubEnrollmentResult {
-  relationshipId: string;
+  daemonId: string;
   scopes: string[];
   webSocketUrl: string;
 }
 
 export interface HubRevocation {
-  relationshipId: string;
+  daemonId: string;
   hubOrigin: string;
   credential: string;
 }
 
 export interface HubSocketCredentials {
-  relationshipId: string;
+  daemonId: string;
   webSocketUrl: string;
   credential: string;
 }
@@ -56,7 +56,7 @@ export class HubEnrollmentRejectedError extends Error {
 }
 
 const EnrollmentResultSchema = z.object({
-  relationshipId: z.string(),
+  daemonId: z.string(),
   scopes: z.array(z.string()),
   webSocketUrl: z
     .string()
@@ -87,14 +87,14 @@ export class DirectHubRelationshipRemote implements HubRelationshipRemote {
 
   async enroll(input: HubEnrollment): Promise<HubEnrollmentResult> {
     return this.withRequestTimeout(async (signal) => {
-      const response = await fetch(`${input.hubOrigin}/api/daemon-relationships/enroll`, {
+      const response = await fetch(`${input.hubOrigin}/api/daemons/enroll`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
           authorization: `Bearer ${input.token}`,
         },
         body: JSON.stringify({
-          relationshipId: input.relationshipId,
+          daemonId: input.daemonId,
           idempotencyKey: input.idempotencyKey,
           serverId: input.serverId,
           daemonPublicKey: input.daemonPublicKey,
@@ -118,7 +118,7 @@ export class DirectHubRelationshipRemote implements HubRelationshipRemote {
   async revoke(input: HubRevocation): Promise<void> {
     await this.withRequestTimeout(async (signal) => {
       const response = await fetch(
-        `${input.hubOrigin}/api/daemon-relationships/${encodeURIComponent(input.relationshipId)}`,
+        `${input.hubOrigin}/api/daemons/${encodeURIComponent(input.daemonId)}`,
         {
           method: "DELETE",
           headers: { authorization: `Bearer ${input.credential}` },
@@ -136,7 +136,7 @@ export class DirectHubRelationshipRemote implements HubRelationshipRemote {
       handshakeTimeout: this.requestTimeoutMs,
       headers: {
         authorization: `Bearer ${input.credential}`,
-        "x-paseo-relationship-id": input.relationshipId,
+        "x-paseo-daemon-id": input.daemonId,
       },
     });
     let settled = false;

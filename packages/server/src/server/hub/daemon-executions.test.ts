@@ -24,18 +24,15 @@ test("sequential replay after reconstruction keeps one durable owned agent", asy
 
   expect(reconstructed.replay.agent.id).toBe(created.first.agentId);
   expect(reconstructed.replay.agent.status).toBe("closed");
-  expect(reconstructed.reconciliation?.agent.id).toBe(created.first.agentId);
-  expect(reconstructed.reconciliation?.agent.status).toBe("closed");
   expect(reconstructed.durableAgentCount).toBe(1);
 });
 
-test("removing an owned agent removes its reconstructed execution association", async () => {
+test("removing a daemon-owned agent removes its execution association", async () => {
   const hub = await launchRelationship();
   const created = await hub.createOwnedConcurrently();
 
-  const removed = await hub.removeAndReconcile(created.first.agentId);
+  const removed = await hub.removeOwnedAgent(created.first.agentId);
 
-  expect(removed.reconciliation).toBeNull();
   expect(removed.durableAgentCount).toBe(0);
 });
 
@@ -49,7 +46,7 @@ test("a failed Hub create removes its auto-created worktree", async () => {
   const response = await hub.ownedCreateResult("failed-worktree-create");
 
   expect(response).toMatchObject({
-    type: "hub.agent.create.response",
+    type: "hub.execution.agent.create.response",
     payload: { success: false, executionId: "failed-worktree-execution" },
   });
   expect(await hub.listedWorktrees()).toHaveLength(1);
@@ -68,7 +65,7 @@ test("failed Hub auto-archive creates release their lifecycle subscriptions", as
   const first = await hub.ownedCreateResult("failed-prompt-create-1");
 
   expect(first).toMatchObject({
-    type: "hub.agent.create.response",
+    type: "hub.execution.agent.create.response",
     payload: { success: false, executionId: "failed-prompt-execution-1" },
   });
   expect(hub.activeOwnedAgentIds()).toEqual([]);
@@ -84,7 +81,7 @@ test("failed Hub auto-archive creates release their lifecycle subscriptions", as
   const second = await hub.ownedCreateResult("failed-prompt-create-2");
 
   expect(second).toMatchObject({
-    type: "hub.agent.create.response",
+    type: "hub.execution.agent.create.response",
     payload: { success: false, executionId: "failed-prompt-execution-2" },
   });
   expect(hub.activeOwnedAgentIds()).toEqual([]);
@@ -104,7 +101,7 @@ test("failed Hub create cleans durable state when provider close rejects", async
   const response = await hub.ownedCreateResult("failed-close-create");
 
   expect(response).toMatchObject({
-    type: "hub.agent.create.response",
+    type: "hub.execution.agent.create.response",
     payload: { success: false, executionId: "failed-close-execution" },
   });
   expect(hub.activeOwnedAgentIds()).toEqual([]);
@@ -122,7 +119,7 @@ test("Hub checkout uses the requested branch ref", async () => {
   const response = await hub.ownedCreateResult("checkout-create");
 
   expect(response).toMatchObject({
-    type: "hub.agent.create.response",
+    type: "hub.execution.agent.create.response",
     payload: { success: true, executionId: "checkout-execution" },
   });
   expect(await hub.currentBranch(hub.latestCreatedCwd()!)).toBe("existing-hub-branch");
@@ -148,7 +145,7 @@ test("failed create never archives a reused worktree", async () => {
   const reused = await hub.ownedCreateResult("reused-create");
 
   expect(reused).toMatchObject({
-    type: "hub.agent.create.response",
+    type: "hub.execution.agent.create.response",
     payload: { success: false, executionId: "reused-execution" },
   });
   expect(await hub.worktreeState(worktreeCwd!)).toEqual({ exists: true, listed: true });

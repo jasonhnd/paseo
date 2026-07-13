@@ -158,6 +158,7 @@ export class HubRelationshipController implements HubRelationshipManagement {
   private socket: HubSocketConnection | null = null;
   private retry: ScheduledRelationshipTask | null = null;
   private generation = 0;
+  private enrollmentGeneration = 0;
   private retryAttempt = 0;
   private executions: { relationshipId: string; value: HubExecutions } | null = null;
 
@@ -176,8 +177,9 @@ export class HubRelationshipController implements HubRelationshipManagement {
   async start(): Promise<void> {
     if (this.record?.state === "active") this.openSocket(this.record, false);
     if (this.record?.state === "pending") {
+      const enrollmentGeneration = this.beginEnrollmentAttempt();
       try {
-        await this.tryEnrollment(this.record);
+        await this.tryEnrollment(this.record, enrollmentGeneration);
       } catch (error) {
         if (!(error instanceof HubEnrollmentRejectedError)) throw error;
         this.options.logger.warn(
@@ -212,8 +214,11 @@ export class HubRelationshipController implements HubRelationshipManagement {
         throw new Error("A pending Hub enrollment already exists for a different Hub");
       }
       this.record = { ...this.record, enrollment: { token: input.token } };
+      const enrollmentGeneration = this.beginEnrollmentAttempt();
       this.persist(this.record);
-      await this.tryEnrollment(this.record);
+      this.state = "connecting";
+      this.lastError = null;
+      await this.tryEnrollment(this.record, enrollmentGeneration);
       return this.status();
     }
     if (this.record && this.record.state !== "revoked") {
@@ -236,7 +241,8 @@ export class HubRelationshipController implements HubRelationshipManagement {
     this.persist(pending);
     this.record = pending;
     this.state = "connecting";
-    await this.tryEnrollment(pending);
+    this.lastError = null;
+    await this.tryEnrollment(pending, this.beginEnrollmentAttempt());
     return this.status();
   }
 
@@ -271,8 +277,8 @@ export class HubRelationshipController implements HubRelationshipManagement {
     return { status: this.status() };
   }
 
-  private async tryEnrollment(pending: PendingRecord): Promise<void> {
-    const generation = this.generation;
+  private async tryEnrollment(pending: PendingRecord, enrollmentGeneration: number): Promise<void> {
+    if (enrollmentGeneration !== this.enrollmentGeneration) return;
     const verifier = createHash("sha256").update(pending.credential.secret).digest("base64url");
     try {
       const enrollment = await this.options.remote.enroll({
@@ -285,7 +291,7 @@ export class HubRelationshipController implements HubRelationshipManagement {
         credentialVerifier: verifier,
         scopes: pending.relationship.scopes,
       });
-      if (generation !== this.generation) return;
+      if (enrollmentGeneration !== this.enrollmentGeneration) return;
       if (
         enrollment.relationshipId !== pending.relationship.id ||
         !enrollment.scopes.includes("hub.*")
@@ -301,16 +307,17 @@ export class HubRelationshipController implements HubRelationshipManagement {
       };
       this.persist(active);
       this.record = active;
+      this.retry = null;
       this.retryAttempt = 0;
       this.openSocket(active, false);
     } catch (error) {
-      if (generation !== this.generation) return;
+      if (enrollmentGeneration !== this.enrollmentGeneration) return;
       if (error instanceof HubEnrollmentRejectedError) {
         this.remove();
         throw error;
       }
       this.lastError = error instanceof Error ? error.message : String(error);
-      this.scheduleEnrollment(pending);
+      this.scheduleEnrollment(pending, enrollmentGeneration);
     }
   }
 
@@ -380,9 +387,15 @@ export class HubRelationshipController implements HubRelationshipManagement {
     this.schedule(() => this.openSocket(record, true));
   }
 
-  private scheduleEnrollment(record: PendingRecord): void {
+  private scheduleEnrollment(record: PendingRecord, enrollmentGeneration: number): void {
+    if (enrollmentGeneration !== this.enrollmentGeneration) return;
     this.state = "reconnecting";
-    this.schedule(() => void this.tryEnrollment(record));
+    this.retry?.cancel();
+    const delay = this.retryPolicy.delay(this.retryAttempt++);
+    this.retry = this.clock.schedule(delay, () => {
+      if (enrollmentGeneration !== this.enrollmentGeneration) return;
+      void this.tryEnrollment(record, enrollmentGeneration);
+    });
   }
 
   private async tryRevocation(record: DisconnectingRecord): Promise<void> {
@@ -435,8 +448,16 @@ export class HubRelationshipController implements HubRelationshipManagement {
 
   private cancelLifecycle(): void {
     ++this.generation;
+    ++this.enrollmentGeneration;
     this.retry?.cancel();
     this.retry = null;
+  }
+
+  private beginEnrollmentAttempt(): number {
+    this.retry?.cancel();
+    this.retry = null;
+    this.retryAttempt = 0;
+    return ++this.enrollmentGeneration;
   }
 
   private persist(record: HubRelationshipRecord): void {

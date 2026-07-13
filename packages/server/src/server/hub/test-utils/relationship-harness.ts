@@ -174,6 +174,10 @@ class TestRelationshipClock implements HubRelationshipClock, HubRelationshipRetr
       }
     }
   }
+
+  pendingTasks(): number {
+    return this.tasks.filter((task) => !task.cancelled).length;
+  }
 }
 
 class MemoryHubSocket extends EventEmitter implements WebSocketLike, HubSocketConnection {
@@ -307,7 +311,11 @@ class InMemoryHubRelationships implements HubRelationshipRemote {
   enrollments: HubEnrollment[] = [];
   revocations: HubRevocation[] = [];
   sockets: SocketAttempt[] = [];
-  private enrollmentGate: Deferred<HubEnrollmentResult> | null = null;
+  private readonly enrollmentGates: Array<Deferred<HubEnrollmentResult>> = [];
+  private readonly heldEnrollments: Array<{
+    input: HubEnrollment;
+    gate: Deferred<HubEnrollmentResult>;
+  }> = [];
   private enrollmentObserved = deferred<void>();
   private socketObserved = deferred<void>();
   private enrollmentRejection: 401 | 403 | null = null;
@@ -319,7 +327,7 @@ class InMemoryHubRelationships implements HubRelationshipRemote {
   constructor(private readonly captureRelationship: () => RelationshipInvocationSnapshot) {}
 
   holdEnrollment(): void {
-    this.enrollmentGate = deferred<HubEnrollmentResult>();
+    this.enrollmentGates.push(deferred<HubEnrollmentResult>());
   }
 
   rejectNextEnrollment(statusCode: 401 | 403): void {
@@ -336,21 +344,33 @@ class InMemoryHubRelationships implements HubRelationshipRemote {
       this.enrollmentRejection = null;
       throw new HubEnrollmentRejectedError(statusCode);
     }
-    if (this.enrollmentGate) return this.enrollmentGate.promise;
+    const gate = this.enrollmentGates.shift();
+    if (gate) {
+      this.heldEnrollments.push({ input, gate });
+      return gate.promise;
+    }
     return this.enrollmentResult(input);
   }
 
   completeEnrollment(): void {
-    const input = this.enrollments.at(-1);
-    if (!input || !this.enrollmentGate) throw new Error("No enrollment is waiting");
-    this.enrollmentGate.resolve(this.enrollmentResult(input));
-    this.enrollmentGate = null;
+    const held = this.heldEnrollments.at(-1);
+    if (!held) throw new Error("No enrollment is waiting");
+    held.gate.resolve(this.enrollmentResult(held.input));
+    this.heldEnrollments.splice(this.heldEnrollments.indexOf(held), 1);
   }
 
   loseEnrollmentResponse(): void {
-    if (!this.enrollmentGate) throw new Error("No enrollment is waiting");
-    this.enrollmentGate.reject(new Error("Enrollment response was lost"));
-    this.enrollmentGate = null;
+    const held = this.heldEnrollments.at(-1);
+    if (!held) throw new Error("No enrollment is waiting");
+    held.gate.reject(new Error("Enrollment response was lost"));
+    this.heldEnrollments.splice(this.heldEnrollments.indexOf(held), 1);
+  }
+
+  rejectEnrollment(index: number, statusCode: 401 | 403): void {
+    const held = this.heldEnrollments[index];
+    if (!held) throw new Error(`Enrollment ${index} is not waiting`);
+    held.gate.reject(new HubEnrollmentRejectedError(statusCode));
+    this.heldEnrollments.splice(index, 1);
   }
 
   async enrollmentAt(index: number): Promise<HubEnrollment> {
@@ -533,6 +553,14 @@ export class HubRelationshipHarness {
 
   loseEnrollmentResponse(): void {
     this.remote.loseEnrollmentResponse();
+  }
+
+  rejectEnrollment(index: number, statusCode: 401 | 403): void {
+    this.remote.rejectEnrollment(index, statusCode);
+  }
+
+  pendingRelationshipRetries(): number {
+    return this.clock.pendingTasks();
   }
 
   rejectNextEnrollment(statusCode: 401 | 403): void {

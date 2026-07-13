@@ -172,6 +172,30 @@ describe("Hub relationship", () => {
     await secondResult;
   });
 
+  test("a stale enrollment rejection cannot discard a fresh pending ceremony", async () => {
+    relationship = await HubRelationshipHarness.start();
+    relationship.holdEnrollment();
+    const expiredConnect = relationship.beginConnect("expired-token");
+    await relationship.enrollmentBegins();
+
+    relationship.holdEnrollment();
+    const freshConnect = relationship.beginConnect("fresh-token");
+    const freshEnrollment = await relationship.enrollmentBegins();
+    relationship.rejectEnrollment(0, 403);
+    await expiredConnect.result;
+
+    expect(relationship.relationshipFile()?.enrollment?.token).toBe("fresh-token");
+    expect(relationship.pendingRelationshipRetries()).toBe(0);
+
+    relationship.completeEnrollment();
+    await freshConnect.result;
+
+    expect(freshEnrollment.token).toBe("fresh-token");
+    expect(relationship.relationshipFile()?.state).toBe("active");
+    expect(relationship.enrollmentAttempts()).toHaveLength(2);
+    expect(relationship.pendingRelationshipRetries()).toBe(0);
+  });
+
   test("a rejected pending enrollment is discarded without blocking daemon restart", async () => {
     relationship = await HubRelationshipHarness.start();
     relationship.holdEnrollment();

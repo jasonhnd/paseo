@@ -241,6 +241,7 @@ class ControlledAgentClient implements AgentClient {
   private gate: Deferred<void> | null = null;
   private creationObserved = deferred<void>();
   creations = 0;
+  resumes = 0;
   createdConfigs: AgentSessionConfig[] = [];
 
   constructor(private readonly client: AgentClient) {
@@ -282,6 +283,7 @@ class ControlledAgentClient implements AgentClient {
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
+    this.resumes++;
     return this.client.resumeSession(handle, overrides, launchContext);
   }
 
@@ -629,6 +631,10 @@ export class HubRelationshipHarness {
 
   providerCreations(): number {
     return this.codex.creations;
+  }
+
+  providerResumes(): number {
+    return this.codex.resumes;
   }
 
   latestCreatedCwd(): string | null {
@@ -1133,6 +1139,7 @@ export class HubRelationshipHarness {
       relationshipId: this.relationshipFile()!.relationship.id,
       agentManager: manager,
       agentStorage: storage,
+      logger: pino({ level: "silent" }),
       createAgent: (input) =>
         createAgentCommand(
           {

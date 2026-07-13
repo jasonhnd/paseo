@@ -1047,6 +1047,7 @@ export async function createPaseoDaemon(
         agentManager,
         agentStorage,
         createAgent,
+        logger,
         registerAutoArchive: ({ agentId, createdWorktree }) =>
           hubAgentLifecycle.registerAutoArchiveIfRequested({
             autoArchive: true,

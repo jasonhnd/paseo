@@ -301,9 +301,7 @@ export class HubRelationshipController implements HubRelationshipManagement {
       connected: (socket) => this.socketConnected(generation, record, socket),
       rejected: (statusCode) => this.socketRejected(generation, statusCode),
       closed: (code) => this.socketClosed(generation, record, code),
-      failed: (error) => {
-        if (generation === this.generation) this.lastError = error.message;
-      },
+      failed: (error) => this.socketFailed(generation, record, error),
     };
     this.socket = this.options.remote.openSocket(
       {
@@ -348,6 +346,12 @@ export class HubRelationshipController implements HubRelationshipManagement {
       this.revoke("Hub revoked this relationship");
       return;
     }
+    if (this.record?.state === "active") this.scheduleSocket(record);
+  }
+
+  private socketFailed(generation: number, record: ActiveRecord, error: Error): void {
+    if (generation !== this.generation) return;
+    this.lastError = error.message;
     if (this.record?.state === "active") this.scheduleSocket(record);
   }
 

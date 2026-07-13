@@ -90,7 +90,13 @@ export class HubSession {
   }
 
   private async reconcile(message: HubExecutionReconcileRequest): Promise<void> {
-    const result = await this.executions.reconcile(message.executionId);
+    let result: Awaited<ReturnType<HubExecutions["reconcile"]>> = null;
+    try {
+      result = await this.executions.reconcile(message.executionId);
+    } catch {
+      // Reconcile has no error variant on the wire. A terminal empty response
+      // lets Hub stop waiting and decide whether to replay the execution.
+    }
     this.send({
       type: "hub.execution.reconcile.response",
       payload: {

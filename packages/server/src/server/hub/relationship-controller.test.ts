@@ -192,10 +192,11 @@ describe("Hub relationship", () => {
     expect(reconciled).toMatchObject({
       executionId: "execution-running",
       agentId: created.payload.agentId,
-      agent: { id: created.payload.agentId, status: "running" },
+      agent: { id: created.payload.agentId, status: "idle" },
     });
     expect(durableAgentIds).toEqual([created.payload.agentId]);
     expect(relationship.providerCreations()).toBe(1);
+    expect(relationship.providerResumes()).toBe(1);
   });
 
   test("stale socket generations cannot replace or unregister the current socket", async () => {

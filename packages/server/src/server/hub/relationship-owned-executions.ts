@@ -3,9 +3,11 @@ import type {
   AgentStreamEventPayload,
   CreateAgentWorktreeTarget,
 } from "@getpaseo/protocol/messages";
+import type { Logger } from "pino";
 
 import type { AgentManager, AgentManagerEvent, ManagedAgent } from "../agent/agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "../agent/agent-storage.js";
+import { ensureAgentLoaded } from "../agent/agent-loading.js";
 import type { BoundCreateAgentCommand } from "../agent/create-agent/create.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../worktree-session.js";
 import { buildStoredAgentPayload } from "../agent/agent-projections.js";
@@ -46,6 +48,7 @@ interface RelationshipOwnedExecutionsOptions {
   agentManager: AgentManager;
   agentStorage: AgentStorage;
   createAgent: BoundCreateAgentCommand;
+  logger: Logger;
   registerAutoArchive?: (input: {
     agentId: string;
     createdWorktree: CreatePaseoWorktreeWorkflowResult | null;
@@ -67,6 +70,7 @@ export class RelationshipOwnedExecutions implements HubExecutions {
   private readonly agentManager: AgentManager;
   private readonly agentStorage: AgentStorage;
   private readonly createAgentCommand: BoundCreateAgentCommand;
+  private readonly logger: Logger;
   private readonly pendingCreates = new Map<string, Promise<OwnedAgentSnapshot>>();
   private readonly registerAutoArchive: (input: {
     agentId: string;
@@ -81,6 +85,7 @@ export class RelationshipOwnedExecutions implements HubExecutions {
     this.agentManager = options.agentManager;
     this.agentStorage = options.agentStorage;
     this.createAgentCommand = options.createAgent;
+    this.logger = options.logger;
     this.registerAutoArchive = options.registerAutoArchive ?? (() => undefined);
     this.cleanupFailedCreate = options.cleanupFailedCreate ?? (async () => undefined);
   }
@@ -104,7 +109,7 @@ export class RelationshipOwnedExecutions implements HubExecutions {
 
   async reconcile(executionId: string): Promise<OwnedAgentSnapshot | null> {
     const record = await this.agentStorage.findByHubExecution(this.owner(executionId));
-    return record ? this.projectRecord(record) : null;
+    return record ? this.resolveRecord(record) : null;
   }
 
   subscribe(listener: (event: OwnedAgentEvent) => void): () => void {
@@ -125,7 +130,7 @@ export class RelationshipOwnedExecutions implements HubExecutions {
   ): Promise<OwnedAgentSnapshot> {
     const existing = await this.agentStorage.findByHubExecution(owner);
     if (existing) {
-      return this.projectRecord(existing);
+      return this.resolveRecord(existing);
     }
 
     let createdWorktree: CreatePaseoWorktreeWorkflowResult | null = null;
@@ -164,6 +169,21 @@ export class RelationshipOwnedExecutions implements HubExecutions {
       executionId: owner.executionId,
       agent: serializeAgentSnapshot(result.liveSnapshot),
     };
+  }
+
+  private async resolveRecord(record: StoredAgentRecord): Promise<OwnedAgentSnapshot> {
+    if (
+      !this.agentManager.getAgent(record.id) &&
+      !record.archivedAt &&
+      record.lastStatus !== "closed"
+    ) {
+      await ensureAgentLoaded(record.id, {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.logger,
+      });
+    }
+    return this.projectRecord(record);
   }
 
   private projectRecord(record: StoredAgentRecord): OwnedAgentSnapshot {

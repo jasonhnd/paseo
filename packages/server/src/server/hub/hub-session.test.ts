@@ -15,12 +15,14 @@ import { HubSession } from "./hub-session.js";
 
 class InMemoryHubExecutions implements HubExecutions {
   private readonly listeners = new Set<(event: OwnedAgentEvent) => void>();
+  private reconcileError: Error | null = null;
 
   async create(_input: HubAgentCreateInput): Promise<OwnedAgentSnapshot> {
     return { executionId: "execution-1", agent: createAgentSnapshot() };
   }
 
   async reconcile(_executionId: string): Promise<OwnedAgentSnapshot | null> {
+    if (this.reconcileError) throw this.reconcileError;
     return { executionId: "execution-1", agent: createAgentSnapshot() };
   }
 
@@ -33,6 +35,10 @@ class InMemoryHubExecutions implements HubExecutions {
     for (const listener of this.listeners) {
       listener({ type: "update", executionId: "execution-1", agent: createAgentSnapshot() });
     }
+  }
+
+  failReconcile(error: Error): void {
+    this.reconcileError = error;
   }
 }
 
@@ -52,6 +58,19 @@ class HubSessionBoundary {
     this.session.cleanup();
   }
 
+  async failReconcile(): Promise<void> {
+    this.executions.failReconcile(new Error("storage unavailable"));
+    await this.session.handleMessage({
+      type: "hub.execution.reconcile.request",
+      requestId: "reconcile-1",
+      executionId: "execution-1",
+    });
+  }
+
+  deliveredMessages(): SessionOutboundMessage[] {
+    return this.messages.slice();
+  }
+
   deliveredTypes(): string[] {
     return this.messages.map((message) => message.type);
   }
@@ -65,6 +84,24 @@ test("disconnect unsubscribes Hub from later owned-agent updates", () => {
   hub.publishCurrentState();
 
   expect(hub.deliveredTypes()).toEqual(["hub.agent.update"]);
+});
+
+test("reconcile storage failures receive a terminal empty response", async () => {
+  const hub = new HubSessionBoundary();
+
+  await hub.failReconcile();
+
+  expect(hub.deliveredMessages()).toEqual([
+    {
+      type: "hub.execution.reconcile.response",
+      payload: {
+        requestId: "reconcile-1",
+        executionId: "execution-1",
+        agentId: null,
+        agent: null,
+      },
+    },
+  ]);
 });
 
 function createAgentSnapshot(): AgentSnapshotPayload {

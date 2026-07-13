@@ -104,14 +104,34 @@ export class DirectHubRelationshipRemote implements HubRelationshipRemote {
         "x-paseo-relationship-id": input.relationshipId,
       },
     });
-    socket.once("open", () => events.connected(socket as WebSocketLike));
+    let settled = false;
+    socket.once("open", () => {
+      if (!settled) events.connected(socket as WebSocketLike);
+    });
     socket.once("unexpected-response", (_request, response) => {
+      if (settled) {
+        response.destroy();
+        return;
+      }
+      settled = true;
+      response.destroy();
+      socket.terminate();
       if (response.statusCode === 401 || response.statusCode === 403) {
         events.rejected(response.statusCode);
+        return;
       }
+      events.closed(1006);
     });
-    socket.once("close", (code) => events.closed(code));
-    socket.once("error", (error) => events.failed(error));
+    socket.once("close", (code) => {
+      if (settled) return;
+      settled = true;
+      events.closed(code);
+    });
+    socket.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      events.failed(error);
+    });
     return socket;
   }
 }

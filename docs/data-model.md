@@ -22,6 +22,8 @@ $PASEO_HOME/
 ├── agents/
 │   └── {sanitized-cwd}/
 │       └── {agentId}.json               # One file per agent
+├── hub-executions/
+│   └── {relationship-execution-hash}.json # Interrupted Hub turn resume intent
 ├── schedules/
 │   └── {scheduleId}.json                # One file per schedule
 ├── chat/
@@ -38,6 +40,11 @@ $PASEO_HOME/
 ```
 
 The `agents/{sanitized-cwd}/` directory name is derived from the agent's `cwd` by stripping the filesystem root and replacing path separators with `-` (Windows drive letters become a `C-` style prefix). Persistent server stores write atomically by writing a temp file in the target directory and then renaming it into place.
+
+Hub execution resume intents contain the relationship ID, execution ID, original prompt, and stable
+message ID only while the owned initial turn is running. They are separate from agent snapshots so
+ordinary trusted-client prompts never acquire restart replay behavior. Terminal or completed Hub
+turns remove the intent; a stored non-running agent also clears any stale file during reconciliation.
 
 ---
 

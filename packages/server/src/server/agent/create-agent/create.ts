@@ -85,6 +85,7 @@ export interface CreateAgentFromMcpInput {
   provider: string;
   title: string;
   initialPrompt?: string;
+  clientMessageId?: string;
   config?: Partial<AgentSessionConfig>;
   cwd?: string;
   workspaceId?: string;
@@ -315,6 +316,7 @@ async function resolveMcpCreateAgent(
   });
 
   const trimmedPrompt = input.initialPrompt?.trim() ?? "";
+  const clientMessageId = normalizeClientMessageId(input.clientMessageId);
   return {
     config: buildMcpSessionConfig({
       input,
@@ -332,6 +334,7 @@ async function resolveMcpCreateAgent(
       env: input.env,
     },
     prompt: trimmedPrompt ? trimmedPrompt : undefined,
+    runOptions: clientMessageId ? { messageId: clientMessageId } : undefined,
     setupContinuation,
     createdWorktree,
     background: input.background,

@@ -25,6 +25,7 @@ import type {
   AgentClient,
   AgentCreateSessionOptions,
   AgentLaunchContext,
+  AgentPromptInput,
   AgentPersistenceHandle,
   AgentSession,
   AgentSessionConfig,
@@ -36,6 +37,7 @@ import { DaemonClient } from "../../test-utils/daemon-client.js";
 import { AgentStorage } from "../../agent/agent-storage.js";
 import { AgentManager } from "../../agent/agent-manager.js";
 import { RelationshipOwnedExecutions } from "../relationship-owned-executions.js";
+import { HubExecutionResumeStore } from "../execution-resume-store.js";
 import {
   createAgentCommand,
   type CreateAgentCommandDependencies,
@@ -422,9 +424,15 @@ export class HubRelationshipHarness {
   private paseoHome = "";
   private host = "";
   private readonly logs: string[] = [];
+  private readonly providerPrompts: AgentPromptInput[] = [];
   private observedEnrollments = 0;
   private observedSockets = 0;
-  private readonly codex = new ControlledAgentClient(createTestAgentClients().codex);
+  private reconcileRequests = 0;
+  private readonly codex = new ControlledAgentClient(
+    createTestAgentClients({
+      onStartTurn: (prompt) => this.providerPrompts.push(prompt),
+    }).codex,
+  );
 
   private constructor(private readonly archiveWatchFiles: ArchiveWatchFiles) {}
 
@@ -618,6 +626,14 @@ export class HubRelationshipHarness {
       .map((record) => record.id);
   }
 
+  async hasResumeIntent(executionId: string): Promise<boolean> {
+    const relationshipId = this.relationshipFile()?.relationship.id;
+    if (!relationshipId) throw new Error("Hub relationship is not connected");
+    const store = new HubExecutionResumeStore(this.paseoHome);
+    const intent = await store.get({ kind: "hub", relationshipId, executionId });
+    return intent !== null;
+  }
+
   socketDeliveredResponse(socketIndex: number, requestId: string): boolean {
     const socket = this.remote.sockets[socketIndex];
     if (!socket) throw new Error(`Socket ${socketIndex} does not exist`);
@@ -635,6 +651,12 @@ export class HubRelationshipHarness {
 
   providerResumes(): number {
     return this.codex.resumes;
+  }
+
+  providerPromptTexts(): string[] {
+    return this.providerPrompts.map((prompt) =>
+      typeof prompt === "string" ? prompt : JSON.stringify(prompt),
+    );
   }
 
   latestCreatedCwd(): string | null {
@@ -772,6 +794,36 @@ export class HubRelationshipHarness {
     return message.payload;
   }
 
+  async ownedTurnCompletion(agentId: string): Promise<HubAgentStream["payload"]> {
+    const socket = this.latestSocket().socket;
+    const completed = await socket.messageMatching(
+      (candidate): candidate is HubAgentStream =>
+        candidate.type === "hub.agent.stream" &&
+        candidate.payload.agentId === agentId &&
+        candidate.payload.event.type === "turn_completed",
+    );
+    return completed.payload;
+  }
+
+  async ownedTurnFailure(agentId: string): Promise<HubAgentStream["payload"]> {
+    const failed = await this.latestSocket().socket.messageMatching(
+      (candidate): candidate is HubAgentStream =>
+        candidate.type === "hub.agent.stream" &&
+        candidate.payload.agentId === agentId &&
+        candidate.payload.event.type === "turn_failed",
+    );
+    return failed.payload;
+  }
+
+  latestOwnedTurnCompletions(agentId: string): number {
+    return this.latestSocket().socket.sent.filter(
+      (message) =>
+        message.type === "hub.agent.stream" &&
+        message.payload.agentId === agentId &&
+        message.payload.event.type === "turn_completed",
+    ).length;
+  }
+
   async ownedStream(agentId: string): Promise<HubAgentStream["payload"]> {
     const message = await this.latestSocket().socket.messageMatching(
       (candidate): candidate is HubAgentStream =>
@@ -783,7 +835,7 @@ export class HubRelationshipHarness {
   async reconcileOwned(
     executionId = "execution-1",
   ): Promise<HubExecutionReconcileResponse["payload"]> {
-    const requestId = `reconcile-${executionId}`;
+    const requestId = `reconcile-${executionId}-${++this.reconcileRequests}`;
     this.latestSocket().socket.receive({
       type: "hub.execution.reconcile.request",
       requestId,
@@ -1137,6 +1189,7 @@ export class HubRelationshipHarness {
   private executionsForReconstruction(manager: AgentManager, storage: AgentStorage) {
     return new RelationshipOwnedExecutions({
       relationshipId: this.relationshipFile()!.relationship.id,
+      paseoHome: this.paseoHome,
       agentManager: manager,
       agentStorage: storage,
       logger: pino({ level: "silent" }),

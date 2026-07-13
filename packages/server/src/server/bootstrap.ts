@@ -1044,6 +1044,7 @@ export async function createPaseoDaemon(
     createExecutions: (relationshipId) =>
       new RelationshipOwnedExecutions({
         relationshipId,
+        paseoHome: config.paseoHome,
         agentManager,
         agentStorage,
         createAgent,

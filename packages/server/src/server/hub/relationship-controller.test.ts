@@ -164,14 +164,15 @@ describe("Hub relationship", () => {
     expect(relationship.socketAttempts()).toBe(2);
   });
 
-  test("daemon restart reconstructs an owned agent that was running without creating another", async () => {
+  test("daemon restart resumes an interrupted owned turn and completes it exactly once", async () => {
     relationship = await HubRelationshipHarness.start();
     await relationship.beginConnect().result;
     await relationship.socketDialed();
     relationship.connectLatestSocket();
     const relationshipId = relationship.relationshipFile()?.relationship.id;
+    const prompt = "sleep 30 and then respond with exactly: restarted work completed";
     relationship.beginOwnedCreate("running-create", "execution-running", {
-      prompt: "sleep 30",
+      prompt,
       modeId: "full-access",
     });
     const created = await relationship.ownedCreateResult("running-create");
@@ -181,6 +182,14 @@ describe("Hub relationship", () => {
     await relationship.socketDialed();
     relationship.connectLatestSocket();
     const reconciled = await relationship.reconcileOwned("execution-running");
+    expect(reconciled).toMatchObject({
+      executionId: "execution-running",
+      agentId: created.payload.agentId,
+      agent: { id: created.payload.agentId, status: "running" },
+    });
+
+    const completion = await relationship.ownedTurnCompletion(created.payload.agentId!);
+    const final = await relationship.reconcileOwned("execution-running");
     const durableAgentIds = await relationship.durableOwnedAgentIds();
 
     expect(running).toMatchObject({
@@ -189,14 +198,105 @@ describe("Hub relationship", () => {
       agent: { id: created.payload.agentId, status: "running" },
     });
     expect(relationship.relationshipFile()?.relationship.id).toBe(relationshipId);
-    expect(reconciled).toMatchObject({
+    expect(completion).toMatchObject({
+      executionId: "execution-running",
+      agentId: created.payload.agentId,
+      event: { type: "turn_completed" },
+    });
+    expect(final).toMatchObject({
       executionId: "execution-running",
       agentId: created.payload.agentId,
       agent: { id: created.payload.agentId, status: "idle" },
     });
+    expect(final.agent.status).toBe("idle");
     expect(durableAgentIds).toEqual([created.payload.agentId]);
     expect(relationship.providerCreations()).toBe(1);
     expect(relationship.providerResumes()).toBe(1);
+    expect(relationship.providerPromptTexts()).toEqual([prompt, prompt]);
+    expect(relationship.latestOwnedTurnCompletions(created.payload.agentId!)).toBe(1);
+    expect(await relationship.hasResumeIntent("execution-running")).toBe(false);
+  });
+
+  test("an ordinary duplicate create does not replay a completed owned turn", async () => {
+    relationship = await HubRelationshipHarness.start();
+    await relationship.beginConnect().result;
+    relationship.connectLatestSocket();
+    const prompt = "respond with exactly: completed once";
+    relationship.beginOwnedCreate("completed-create", "execution-completed", { prompt });
+    const created = await relationship.ownedCreateResult("completed-create");
+    await relationship.ownedTurnCompletion(created.payload.agentId!);
+
+    relationship.beginOwnedCreate("completed-duplicate", "execution-completed", { prompt });
+    const duplicate = await relationship.ownedCreateResult("completed-duplicate");
+
+    expect(duplicate).toMatchObject({
+      type: "hub.agent.create.response",
+      payload: {
+        success: true,
+        executionId: "execution-completed",
+        agentId: created.payload.agentId,
+        agent: { status: "idle" },
+      },
+    });
+    expect(relationship.providerPromptTexts()).toEqual([prompt]);
+    expect(await relationship.durableOwnedAgentIds()).toEqual([created.payload.agentId]);
+    expect(relationship.latestOwnedTurnCompletions(created.payload.agentId!)).toBe(1);
+    expect(await relationship.hasResumeIntent("execution-completed")).toBe(false);
+  });
+
+  test("daemon restart does not replay a completed idle owned turn", async () => {
+    relationship = await HubRelationshipHarness.start();
+    await relationship.beginConnect().result;
+    relationship.connectLatestSocket();
+    const prompt = "respond with exactly: already completed";
+    relationship.beginOwnedCreate("idle-create", "execution-idle", { prompt });
+    const created = await relationship.ownedCreateResult("idle-create");
+    await relationship.ownedTurnCompletion(created.payload.agentId!);
+
+    await relationship.restartDaemon();
+    await relationship.socketDialed();
+    relationship.connectLatestSocket();
+    const reconciled = await relationship.reconcileOwned("execution-idle");
+
+    expect(reconciled).toMatchObject({
+      executionId: "execution-idle",
+      agentId: created.payload.agentId,
+      agent: { id: created.payload.agentId, status: "idle" },
+    });
+    expect(relationship.providerPromptTexts()).toEqual([prompt]);
+    expect(relationship.providerResumes()).toBe(0);
+    expect(relationship.latestOwnedTurnCompletions(created.payload.agentId!)).toBe(0);
+    expect(await relationship.hasResumeIntent("execution-idle")).toBe(false);
+  });
+
+  test("daemon restart does not replay a terminal owned turn", async () => {
+    relationship = await HubRelationshipHarness.start();
+    await relationship.beginConnect().result;
+    relationship.connectLatestSocket();
+    const prompt = "emit a turn failure";
+    relationship.beginOwnedCreate("failed-create", "execution-failed", { prompt });
+    const created = await relationship.ownedCreateResult("failed-create");
+    const failed = await relationship.ownedTurnFailure(created.payload.agentId!);
+
+    await relationship.restartDaemon();
+    await relationship.socketDialed();
+    relationship.connectLatestSocket();
+    const reconciled = await relationship.reconcileOwned("execution-failed");
+
+    expect(failed).toMatchObject({
+      executionId: "execution-failed",
+      agentId: created.payload.agentId,
+      event: { type: "turn_failed" },
+    });
+    expect(reconciled).toMatchObject({
+      executionId: "execution-failed",
+      agentId: created.payload.agentId,
+      agent: { id: created.payload.agentId, status: "error" },
+    });
+    expect(relationship.providerPromptTexts()).toEqual([prompt]);
+    expect(relationship.providerResumes()).toBe(0);
+    expect(relationship.latestOwnedTurnCompletions(created.payload.agentId!)).toBe(0);
+    expect(await relationship.hasResumeIntent("execution-failed")).toBe(false);
   });
 
   test("stale socket generations cannot replace or unregister the current socket", async () => {

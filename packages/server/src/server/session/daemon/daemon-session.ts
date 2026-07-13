@@ -107,27 +107,43 @@ export class DaemonSession {
       }
     >,
   ): Promise<void> {
-    if (!this.hubRelationships) throw new Error("Hub relationship management is unavailable");
-    if (msg.type === "hub.relationship.connect.request") {
-      const status = await this.hubRelationships.connect({ hubUrl: msg.hubUrl, token: msg.token });
+    try {
+      if (!this.hubRelationships) throw new Error("Hub relationship management is unavailable");
+      if (msg.type === "hub.relationship.connect.request") {
+        const status = await this.hubRelationships.connect({
+          hubUrl: msg.hubUrl,
+          token: msg.token,
+        });
+        this.host.emit({
+          type: "hub.relationship.connect.response",
+          payload: { requestId: msg.requestId, status },
+        });
+        return;
+      }
+      if (msg.type === "hub.relationship.disconnect.request") {
+        const result = await this.hubRelationships.disconnect({ force: msg.force ?? false });
+        this.host.emit({
+          type: "hub.relationship.disconnect.response",
+          payload: { requestId: msg.requestId, ...result },
+        });
+        return;
+      }
       this.host.emit({
-        type: "hub.relationship.connect.response",
-        payload: { requestId: msg.requestId, status },
+        type: "hub.relationship.get_status.response",
+        payload: { requestId: msg.requestId, status: this.hubRelationships.status() },
       });
-      return;
-    }
-    if (msg.type === "hub.relationship.disconnect.request") {
-      const result = await this.hubRelationships.disconnect({ force: msg.force ?? false });
+    } catch (error) {
+      this.logger.error({ err: error }, "Failed to handle Hub relationship request");
       this.host.emit({
-        type: "hub.relationship.disconnect.response",
-        payload: { requestId: msg.requestId, ...result },
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: error instanceof Error ? error.message : String(error),
+          code: "handler_error",
+        },
       });
-      return;
     }
-    this.host.emit({
-      type: "hub.relationship.get_status.response",
-      payload: { requestId: msg.requestId, status: this.hubRelationships.status() },
-    });
   }
 
   async handleGetStatusRequest(

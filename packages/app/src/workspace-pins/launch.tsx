@@ -10,7 +10,11 @@ import { getProviderIcon } from "@/components/provider-icons";
 import { getIsElectron } from "@/constants/platform";
 import { useDaemonConfig } from "@/hooks/use-daemon-config";
 import type { Theme } from "@/styles/theme";
-import { pinnedTargetKey, type PinnedTabTarget } from "@/workspace-pins/target";
+import {
+  isPinnedTargetAvailable,
+  pinnedTargetKey,
+  type PinnedTabTarget,
+} from "@/workspace-pins/target";
 import { usePinnedTargetsStore } from "@/workspace-pins/store";
 
 export interface ResolvedPin {
@@ -65,6 +69,9 @@ export function usePinnedLaunchers({ serverId, onLaunch }: UsePinnedLaunchersInp
   return useMemo(() => {
     const resolved: ResolvedPin[] = [];
     for (const target of pinned) {
+      if (!isPinnedTargetAvailable(target, { isElectron: getIsElectron() })) {
+        continue;
+      }
       if (target.kind === "draft") {
         resolved.push({
           key: pinnedTargetKey(target),
@@ -84,9 +91,6 @@ export function usePinnedLaunchers({ serverId, onLaunch }: UsePinnedLaunchersInp
         continue;
       }
       if (target.kind === "browser") {
-        if (!getIsElectron()) {
-          continue;
-        }
         resolved.push({
           key: pinnedTargetKey(target),
           label: t("workspace.tabs.actions.newBrowser"),

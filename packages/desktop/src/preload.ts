@@ -1,5 +1,8 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
-import { PASEO_BROWSER_PROFILE_PARTITION } from "./features/browser-profile.js";
+
+// Packaged sandboxed preloads cannot require local modules.
+// Keep this value in sync with features/browser-profile.ts.
+const PASEO_BROWSER_PROFILE_PARTITION = "persist:paseo-browser";
 
 type EventHandler = (payload: unknown) => void;
 

@@ -81,6 +81,7 @@ import type {
   OmpModel,
   OmpRuntimeEvent,
   OmpSessionState,
+  OmpSubagentSnapshot,
   OmpThinkingLevel,
 } from "./rpc-types.js";
 import {
@@ -137,10 +138,53 @@ export interface OmpAgentClientOptions {
   providerIdleScheduler?: OmpProviderIdleScheduler;
   noTurnScheduler?: OmpNoTurnScheduler;
   usagePollScheduler?: OmpUsagePollScheduler;
+  /** Monotonic clock for the provider-idle budget; injected by tests. */
+  now?: () => number;
+}
+
+export interface OmpProviderIdleAttempt {
+  /** State checks already made for this completion gate, 1-based. */
+  attempt: number;
+  /** Consecutive `get_state` rejections; any successful response resets it. */
+  consecutiveFailures: number;
+  /**
+   * Monotonic silence: time since OMP last showed a sign of life, accrued
+   * separately for each budget so time under a long one is never inherited by a
+   * shorter one. Elapsed time alone is not a stall.
+   */
+  elapsedMs: number;
+  /**
+   * Monotonic time since the gate opened, which no progress signal resets. Four
+   * review rounds each found a different signal that could be stuck on, so the
+   * ceiling is what makes the wait bounded without having to enumerate them.
+   */
+  totalElapsedMs: number;
+  /** Whether the last observed state reported compaction in progress. */
+  isCompacting: boolean;
+  /** Whether OMP-internal subagents or tool calls from this turn are outstanding. */
+  isWaitingOnSubagents: boolean;
+}
+
+/**
+ * `reason` names the exhausted budget so the turn reports why it stopped rather
+ * than inferring it from whichever check happened to be last.
+ */
+export type OmpProviderIdleDecision =
+  | { retry: true }
+  | { retry: false; reason: "wait_budget" | "failure_budget" };
+
+interface OmpProviderIdleSilence {
+  compacting: number;
+  work: number;
+  other: number;
+  lastPollAt: number;
+  lastEventAt: number;
+  fingerprint: string | null;
 }
 
 export interface OmpProviderIdleScheduler {
-  waitForRetry(): Promise<void>;
+  /** Wait before the next state check, or abandon the gate so the turn fails. */
+  waitForRetry(attempt: OmpProviderIdleAttempt): Promise<OmpProviderIdleDecision>;
 }
 
 export interface OmpNoTurnScheduler {
@@ -185,6 +229,7 @@ interface OmpAgentSessionOptions {
   providerIdleScheduler?: OmpProviderIdleScheduler;
   noTurnScheduler?: OmpNoTurnScheduler;
   usagePollScheduler?: OmpUsagePollScheduler;
+  now?: () => number;
   paseoTools?: PaseoToolCatalog;
   /**
    * When false (resumed sessions), replayed session events are dropped until
@@ -194,10 +239,70 @@ interface OmpAgentSessionOptions {
   live?: boolean;
 }
 
-function createOmpProviderIdleScheduler(): OmpProviderIdleScheduler {
+// Autonomous OMP cycles carry no turn ID; they still need a gate key of their own.
+const OMP_AUTONOMOUS_GATE_KEY = "autonomous";
+
+// OMP processes a state request only once its RPC loop is promptable again, so
+// the first checks after agent_end usually miss. Poll fast at first, then back
+// off: a stalled provider otherwise costs 100 RPCs a second for as long as the
+// stall lasts.
+const OMP_PROVIDER_IDLE_MIN_RETRY_MS = 10;
+const OMP_PROVIDER_IDLE_MAX_RETRY_MS = 1_000;
+// Wall clock, not a retry count: each get_state carries the JSONL-RPC request
+// timeout, so counting attempts would let a slow-but-answering state path stretch
+// the wait to tens of minutes.
+const OMP_PROVIDER_IDLE_BUDGET_MS = 60_000;
+// Compaction is a model call over the whole context, so it routinely outlasts the
+// idle budget. Waiting on a reported compaction is not the stall this gate guards
+// against, but it still needs an end.
+const OMP_PROVIDER_COMPACTING_BUDGET_MS = 600_000;
+// A fan-out has no bounded length, so this bounds silence about one, not the
+// fan-out itself: a reply whose running children changed restarts the clock.
+const OMP_PROVIDER_SUBAGENT_BUDGET_MS = 600_000;
+// A get_state rejection already costs a full RPC timeout, so a few in a row are
+// enough evidence that the state path is gone.
+const OMP_PROVIDER_IDLE_FAILURE_BUDGET = 3;
+// The wait no progress signal can extend. Generous enough for a real fan-out,
+// finite so an unforeseen signal stuck on cannot restore the unbounded poll.
+const OMP_PROVIDER_IDLE_CEILING_MS = 3_600_000;
+
+function ompProviderIdleRetryDelayMs(attempt: number): number {
+  const backoff = OMP_PROVIDER_IDLE_MIN_RETRY_MS * 2 ** (attempt - 1);
+  return Math.min(OMP_PROVIDER_IDLE_MAX_RETRY_MS, backoff);
+}
+
+// Precedence matches accrueProviderIdleSilence, which decides which bucket the
+// silence went into. If the two disagree, silence is compared against another
+// class's budget.
+function ompProviderIdleBudgetMs(waitingOnSubagents: boolean, compacting: boolean): number {
+  if (compacting) {
+    return OMP_PROVIDER_COMPACTING_BUDGET_MS;
+  }
+  return waitingOnSubagents ? OMP_PROVIDER_SUBAGENT_BUDGET_MS : OMP_PROVIDER_IDLE_BUDGET_MS;
+}
+
+export function createOmpProviderIdleScheduler(): OmpProviderIdleScheduler {
   return {
-    waitForRetry: async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
+    waitForRetry: async ({
+      attempt,
+      consecutiveFailures,
+      elapsedMs,
+      totalElapsedMs,
+      isCompacting,
+      isWaitingOnSubagents,
+    }) => {
+      if (consecutiveFailures >= OMP_PROVIDER_IDLE_FAILURE_BUDGET) {
+        return { retry: false, reason: "failure_budget" };
+      }
+      if (totalElapsedMs >= OMP_PROVIDER_IDLE_CEILING_MS) {
+        return { retry: false, reason: "wait_budget" };
+      }
+      const budgetMs = ompProviderIdleBudgetMs(isWaitingOnSubagents, isCompacting);
+      if (elapsedMs >= budgetMs) {
+        return { retry: false, reason: "wait_budget" };
+      }
+      await delay(ompProviderIdleRetryDelayMs(attempt));
+      return { retry: true };
     },
   };
 }
@@ -526,6 +631,73 @@ function latestOmpErrorMessage(messages: OmpAgentMessage[]): string | null {
   return formatOmpErrorMessage(latestAssistant);
 }
 
+function ompStalledTurnMessage(stateUnavailable: boolean, subagentsBlocked: boolean): string {
+  if (stateUnavailable) {
+    return "OMP finished its response but its state is unavailable, so Paseo cannot confirm the turn ended.";
+  }
+  if (subagentsBlocked) {
+    return "OMP finished its response but never finished its running subagents, so Paseo stopped waiting for the turn to end.";
+  }
+  return "OMP finished its response but never reported an idle state, so Paseo stopped waiting for the turn to end.";
+}
+
+function ompStalledTurnCode(stateUnavailable: boolean, subagentsBlocked: boolean): string {
+  if (stateUnavailable) {
+    return "omp_provider_state_unavailable";
+  }
+  return subagentsBlocked ? "omp_provider_subagent_stall" : "omp_provider_idle_timeout";
+}
+
+const OMP_NON_PROGRESS_EVENT_TYPES = new Set([
+  "notice",
+  "available_commands_update",
+  "goal_updated",
+  "todo_reminder",
+]);
+
+function isOmpTurnProgressEvent(event: OmpRuntimeEvent): boolean {
+  return !OMP_NON_PROGRESS_EVENT_TYPES.has(event.type);
+}
+
+/**
+ * Progress is a reply that differs from the last one.
+ *
+ * Measured against OMP 17.4.0: `lastUpdate` moves per child activity, not per
+ * reply, so it is a real progress signal rather than a clock. It does not move
+ * while a child is busy but quiet - a child running `sleep 40` past its parent's
+ * agent_end held one value for 39.6 s across 80 polls, with no inbound frame
+ * either, because the parent's `task` tool call (whose tool_execution_update
+ * timer fires every 500 ms) has already ended by then. Keying on the running-id
+ * set instead would be strictly worse: it is frozen for the child's whole life.
+ *
+ * The consequence is deliberate and bounded: a child silent for longer than
+ * OMP_PROVIDER_SUBAGENT_BUDGET_MS fails its parent turn, because a snapshot that
+ * never changes is indistinguishable from a wedged one.
+ */
+function ompSubagentFingerprint(snapshots: OmpSubagentSnapshot[]): string {
+  return snapshots
+    .filter(
+      (snapshot) =>
+        snapshot.status !== "completed" &&
+        snapshot.status !== "failed" &&
+        snapshot.status !== "aborted",
+    )
+    .map((snapshot) => `${snapshot.id}:${snapshot.status}:${snapshot.lastUpdate ?? ""}`)
+    .sort()
+    .join("|");
+}
+
+/** Newest agent_end wins, unless it would discard an error the gate already holds. */
+function preferErroredOmpPayload(
+  current: OmpAgentMessage[],
+  incoming: OmpAgentMessage[],
+): OmpAgentMessage[] {
+  if (latestOmpErrorMessage(incoming)) {
+    return incoming;
+  }
+  return latestOmpErrorMessage(current) ? current : incoming;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -843,6 +1015,9 @@ export class OmpAgentSession implements AgentSession {
 
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private readonly activeToolCalls = new Map<string, OmpTrackedToolCall>();
+  /** Tool calls outlive their turn when OMP drops tool_execution_end; the gate
+   * must not treat that leak as work outstanding on a later turn. */
+  private readonly activeToolCallTurns = new Map<string, string | undefined>();
   private readonly deferredTaskResults = new Map<
     string,
     { toolCall: OmpTrackedToolCall; result: OmpToolResult }
@@ -855,6 +1030,8 @@ export class OmpAgentSession implements AgentSession {
   private activeAssistantMessageId: string | null = null;
   private activeTurnTerminalAssistantMessage: OmpAgentMessage | null = null;
   private activeTurnStarted = false;
+  private providerIdleGate: { key: string; messages: OmpAgentMessage[] } | null = null;
+  private lastSessionEventAt = 0;
   private activeTurnHasUserMessage = false;
   private activeNoTurnPromptText: string | null = null;
   private readonly pendingNoTurnOutputs: Array<{ turnId: string; message: string }> = [];
@@ -873,6 +1050,7 @@ export class OmpAgentSession implements AgentSession {
   private state: OmpSessionState;
   private readonly currentModeId: string | null;
   private readonly providerIdleScheduler: OmpProviderIdleScheduler;
+  private readonly now: () => number;
   private readonly noTurnScheduler: OmpNoTurnScheduler;
   private readonly usagePoller: OmpUsagePoller;
   private closed = false;
@@ -888,6 +1066,7 @@ export class OmpAgentSession implements AgentSession {
     this.paseoTools = options.paseoTools;
     this.live = options.live ?? true;
     this.providerIdleScheduler = options.providerIdleScheduler ?? createOmpProviderIdleScheduler();
+    this.now = options.now ?? (() => performance.now());
     this.noTurnScheduler = options.noTurnScheduler ?? createOmpNoTurnScheduler();
     this.usagePoller = new OmpUsagePoller({
       scheduler: options.usagePollScheduler,
@@ -1154,6 +1333,7 @@ export class OmpAgentSession implements AgentSession {
     await this.runtimeSession.branch(target);
     await this.refreshState();
     this.activeToolCalls.clear();
+    this.activeToolCallTurns.clear();
   }
 
   async close(): Promise<void> {
@@ -1161,6 +1341,7 @@ export class OmpAgentSession implements AgentSession {
       return;
     }
     this.closed = true;
+    this.providerIdleGate = null;
     this.usagePoller.close();
     this.cancelNoTurnPromptCompletion();
     try {
@@ -1186,6 +1367,7 @@ export class OmpAgentSession implements AgentSession {
       this.emitToolCallEvent(toolCallId, toolCall, "canceled", null, null);
     }
     this.activeToolCalls.clear();
+    this.activeToolCallTurns.clear();
     for (const event of this.subagentIndex.terminalizeRunning(this.runtimeSession)) {
       this.emit(event);
     }
@@ -1731,6 +1913,14 @@ export class OmpAgentSession implements AgentSession {
   }
 
   private handleRuntimeEvent(event: OmpRuntimeEvent): void {
+    // Only frames that mean the turn advanced count as progress. Host chatter —
+    // notices, command lists, goal timers, todo reminders — arrives on its own
+    // cadence and would otherwise refill the budget forever. Stamped here rather
+    // than in handleSessionEvent because subagent narration, auto-compaction and
+    // host-tool traffic never reach that far.
+    if (isOmpTurnProgressEvent(event)) {
+      this.lastSessionEventAt = this.now();
+    }
     if (isExtensionUiRequestEvent(event)) {
       this.handleExtensionUiRequest(event);
       return;
@@ -1840,6 +2030,7 @@ export class OmpAgentSession implements AgentSession {
       case "tool_execution_start": {
         const toolCall = parseToolArgs(event.toolName, event.args);
         this.activeToolCalls.set(event.toolCallId, toolCall);
+        this.activeToolCallTurns.set(event.toolCallId, turnId);
         this.activeAskUserDialog = readActiveAskUserDialog(event.toolName, event.args);
         this.emitToolCallEvent(event.toolCallId, toolCall, "running", null, null);
         return;
@@ -1894,7 +2085,11 @@ export class OmpAgentSession implements AgentSession {
         }
         // A state request is processed after OMP's RPC loop becomes promptable,
         // so do not advertise Paseo idle until it reports that transition.
-        void this.completeTurnAfterProviderIdle(turnId, terminalMessages);
+        void this.completeTurnAfterProviderIdle(turnId, terminalMessages).catch(
+          (error: unknown) => {
+            this.logger.warn({ err: error }, "OMP provider idle gate failed");
+          },
+        );
         return;
       }
       default:
@@ -1919,6 +2114,7 @@ export class OmpAgentSession implements AgentSession {
     // the call active until the index has a linked child and none are running.
     if (event.toolName === "task" && !event.isError) {
       this.activeToolCalls.set(event.toolCallId, toolCall);
+      this.activeToolCallTurns.set(event.toolCallId, turnId);
       this.deferredTaskResults.set(event.toolCallId, { toolCall, result });
       this.emitToolCallEvent(event.toolCallId, toolCall, "running", result, null);
       this.settleDeferredTaskCalls();
@@ -1926,6 +2122,7 @@ export class OmpAgentSession implements AgentSession {
     }
 
     this.activeToolCalls.delete(event.toolCallId);
+    this.activeToolCallTurns.delete(event.toolCallId);
     const error = event.isError ? event.result : null;
     const status = event.isError ? "failed" : "completed";
     this.emitToolCallEvent(event.toolCallId, toolCall, status, result, error);
@@ -1968,6 +2165,7 @@ export class OmpAgentSession implements AgentSession {
     }
     this.deferredTaskResults.delete(toolCallId);
     this.activeToolCalls.delete(toolCallId);
+    this.activeToolCallTurns.delete(toolCallId);
     this.emitToolCallEvent(toolCallId, pending.toolCall, "completed", pending.result, null);
     this.subagentCardTracker.delete(toolCallId);
   }
@@ -2169,8 +2367,7 @@ export class OmpAgentSession implements AgentSession {
     });
   }
 
-  private completeTurn(turnId: string | undefined, messages: OmpAgentMessage[]): void {
-    this.forceSettleDeferredTaskCalls();
+  private resetActiveTurn(): void {
     this.activeTurnId = null;
     this.activeClientMessageId = null;
     this.activeAssistantMessageId = null;
@@ -2178,6 +2375,11 @@ export class OmpAgentSession implements AgentSession {
     this.activeTurnStarted = false;
     this.activeTurnHasUserMessage = false;
     this.clearNoTurnBuffers();
+  }
+
+  private completeTurn(turnId: string | undefined, messages: OmpAgentMessage[]): void {
+    this.forceSettleDeferredTaskCalls();
+    this.resetActiveTurn();
     const errorMessage = latestOmpErrorMessage(messages);
     if (typeof errorMessage === "string" && errorMessage.length > 0) {
       this.usagePoller.stopTurn();
@@ -2198,38 +2400,259 @@ export class OmpAgentSession implements AgentSession {
     void this.refreshAfterTurn(finalUsage);
   }
 
+  /** Ownership can change across an await; completing a turn this gate no longer
+   * represents would clear the turn that replaced it. */
+  private completeTurnIfGateOwned(turnId: string | undefined, messages: OmpAgentMessage[]): void {
+    if (!this.ownsProviderIdleGate(turnId)) {
+      return;
+    }
+    this.completeTurn(turnId, messages);
+  }
+
+  /**
+   * The budget spends silence, not elapsed time. An inbound frame or a subagent
+   * reply that changed since the last one is progress and clears it. A flag
+   * staying on is not: that is the stall being bounded. Each class keeps its own
+   * total so time under a long budget is not inherited by a shorter one.
+   */
+  private accrueProviderIdleSilence(
+    silence: OmpProviderIdleSilence,
+    fingerprint: string | null,
+    observed: { compacting: boolean; waitingOnWork: boolean },
+  ): number {
+    const now = this.now();
+    const progressed =
+      this.lastSessionEventAt !== silence.lastEventAt || fingerprint !== silence.fingerprint;
+    silence.lastEventAt = this.lastSessionEventAt;
+    silence.fingerprint = fingerprint;
+    const delta = now - silence.lastPollAt;
+    silence.lastPollAt = now;
+    if (progressed) {
+      silence.compacting = 0;
+      silence.work = 0;
+      silence.other = 0;
+    } else if (observed.compacting) {
+      silence.compacting += delta;
+    } else if (observed.waitingOnWork) {
+      silence.work += delta;
+    } else {
+      silence.other += delta;
+    }
+    if (observed.compacting) {
+      return silence.compacting;
+    }
+    return observed.waitingOnWork ? silence.work : silence.other;
+  }
+
+  private hasActiveToolCallsFor(turnId: string | undefined): boolean {
+    for (const [toolCallId, toolCallTurnId] of this.activeToolCallTurns) {
+      if (toolCallTurnId === turnId && this.activeToolCalls.has(toolCallId)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private ownsProviderIdleGate(turnId: string | undefined): boolean {
+    return !this.closed && this.activeTurnStarted && this.currentTurnIdForEvent() === turnId;
+  }
+
   private async completeTurnAfterProviderIdle(
     turnId: string | undefined,
     messages: OmpAgentMessage[],
   ): Promise<void> {
-    while (!this.closed && this.activeTurnStarted && this.currentTurnIdForEvent() === turnId) {
-      try {
-        const state = await this.runtimeSession.getState();
-        this.state = state;
-        // Parent model idle is not enough: OMP-internal `task` children keep
-        // writing after agent_end / isStreaming=false (#2232).
-        if (!state.isStreaming && !state.isCompacting && !(await this.hasRunningOmpSubagents())) {
-          this.completeTurn(turnId, messages);
+    // OMP can end more than one cycle for a single prompt. Without this gate a
+    // second loop races the first and completes the same turn twice. Autonomous
+    // cycles carry no turn ID, so they share one key: their loop polls too.
+    const key = turnId ?? OMP_AUTONOMOUS_GATE_KEY;
+    if (this.providerIdleGate?.key === key) {
+      // The newest agent_end owns the terminal payload so a later provider error
+      // is not dropped, except when it would drop one the gate already holds.
+      this.providerIdleGate.messages = preferErroredOmpPayload(
+        this.providerIdleGate.messages,
+        messages,
+      );
+      return;
+    }
+    const gate = { key, messages };
+    this.providerIdleGate = gate;
+    try {
+      // Silence is counted per budget class. One shared clock would make time
+      // spent under the ten-minute compaction budget instantly delinquent the
+      // moment the sixty-second stall budget takes over.
+      const gateStartedAt = this.now();
+      const silence: OmpProviderIdleSilence = {
+        compacting: 0,
+        work: 0,
+        other: 0,
+        lastPollAt: this.now(),
+        lastEventAt: this.lastSessionEventAt,
+        fingerprint: null,
+      };
+      let subagentFingerprint: string | null = null;
+      let attempt = 0;
+      let consecutiveFailures = 0;
+      let lastState: OmpSessionState | null = null;
+      let lastError: unknown = null;
+      let subagentsConfirmed = false;
+      while (this.ownsProviderIdleGate(turnId)) {
+        attempt += 1;
+        try {
+          const state = await this.runtimeSession.getState();
+          this.state = state;
+          lastState = state;
+          consecutiveFailures = 0;
+          // Parent model idle is not enough: OMP-internal `task` children keep
+          // writing after agent_end / isStreaming=false (#2232).
+          const modelBusy = state.isStreaming || state.isCompacting;
+          const subagents = modelBusy ? null : await this.pollOmpSubagents();
+          subagentsConfirmed = (subagents?.fingerprint ?? "") !== "";
+          if (subagents) {
+            subagentFingerprint = subagents.fingerprint ?? subagentFingerprint;
+          }
+          if (subagents && !subagents.running) {
+            this.completeTurnIfGateOwned(turnId, gate.messages);
+            return;
+          }
+        } catch (error) {
+          lastError = error;
+          consecutiveFailures += 1;
+          subagentsConfirmed = false;
+          this.logger.debug(
+            { err: error },
+            "OMP state unavailable while waiting for provider idle",
+          );
+        }
+        // The budget spends silence, not elapsed time. An inbound frame or a
+        // subagent reply that changed since the last one is progress and clears
+        // it. A flag staying on is not: that is the stall being bounded. The
+        // flags only choose how long silence may last.
+        const compacting = lastState?.isCompacting === true;
+        // A started tool call or an outstanding child is work Paseo can see, and
+        // it earns the longer budget even when OMP says nothing about it.
+        const waitingOnWork =
+          this.subagentIndex.hasRunning(this.runtimeSession) || this.hasActiveToolCallsFor(turnId);
+        const elapsedMs = this.accrueProviderIdleSilence(silence, subagentFingerprint, {
+          compacting,
+          waitingOnWork,
+        });
+        const decision = await this.providerIdleScheduler.waitForRetry({
+          attempt,
+          consecutiveFailures,
+          elapsedMs,
+          totalElapsedMs: this.now() - gateStartedAt,
+          isCompacting: compacting,
+          isWaitingOnSubagents: waitingOnWork,
+        });
+        if (!decision.retry) {
+          if (!this.ownsProviderIdleGate(turnId)) {
+            return;
+          }
+          this.failStalledTurn(turnId, {
+            reason: decision.reason,
+            attempt,
+            consecutiveFailures,
+            lastState,
+            lastError,
+            subagentsConfirmed,
+          });
           return;
         }
-      } catch (error) {
-        this.logger.debug({ err: error }, "OMP state unavailable while waiting for provider idle");
       }
-      await this.providerIdleScheduler.waitForRetry();
+    } finally {
+      if (this.providerIdleGate === gate) {
+        this.providerIdleGate = null;
+      }
     }
   }
 
-  private async hasRunningOmpSubagents(): Promise<boolean> {
+  /**
+   * The fingerprint is what the budget compares: a reply that changed since the
+   * last one is progress. The index alone never is.
+   */
+  private async pollOmpSubagents(): Promise<{ running: boolean; fingerprint: string | null }> {
+    let snapshots: OmpSubagentSnapshot[] | null = null;
     try {
-      const snapshots = await this.runtimeSession.getSubagents();
-      for (const event of this.subagentIndex.reconcileSnapshots(this.runtimeSession, snapshots)) {
-        this.emit(event);
-      }
+      snapshots = await this.runtimeSession.getSubagents();
     } catch (error) {
       this.logger.debug({ err: error }, "OMP get_subagents unavailable during idle gate");
     }
+    if (snapshots) {
+      for (const event of this.subagentIndex.reconcileSnapshots(this.runtimeSession, snapshots)) {
+        this.emit(event);
+      }
+    }
     this.settleDeferredTaskCalls();
-    return this.subagentIndex.hasRunning(this.runtimeSession);
+    return {
+      // `running` is what the gate waits on (#2232) and how long the budget may
+      // run. The fingerprint is what counts as progress: a child merely being
+      // listed again is the same stuck flag the state field would be, so only a
+      // reply that changed since the last one restarts the budget.
+      running: this.subagentIndex.hasRunning(this.runtimeSession),
+      fingerprint: snapshots ? ompSubagentFingerprint(snapshots) : null,
+    };
+  }
+
+  private failStalledTurn(
+    turnId: string | undefined,
+    context: {
+      reason: "wait_budget" | "failure_budget";
+      attempt: number;
+      consecutiveFailures: number;
+      lastState: OmpSessionState | null;
+      lastError: unknown;
+      subagentsConfirmed: boolean;
+    },
+  ): void {
+    // A hanging state path burns the wait budget before the failure budget, so a
+    // gate that never saw a state is an unavailable state path whichever ran out.
+    // Read the index now rather than trusting a flag carried across polls where
+    // subagents were never queried.
+    const subagentsBlocked = this.subagentIndex.hasRunning(this.runtimeSession);
+    const stateUnavailable =
+      context.reason === "failure_budget" || (!context.lastState && context.lastError !== null);
+    // Both observations go into every diagnostic: which budget ran out says what
+    // Paseo did, the last state and the last error say what OMP was doing.
+    const details = [`state checks: ${context.attempt}`];
+    if (context.lastState) {
+      details.push(
+        `last OMP state: isStreaming=${context.lastState.isStreaming}, isCompacting=${context.lastState.isCompacting}`,
+      );
+    }
+    if (context.lastError) {
+      const failureCount =
+        context.consecutiveFailures > 0
+          ? ` after ${context.consecutiveFailures} consecutive failures`
+          : "";
+      details.push(
+        `last get_state error${failureCount}: ${toDiagnosticErrorMessage(context.lastError)}`,
+      );
+    }
+    if (subagentsBlocked) {
+      details.push(
+        context.subagentsConfirmed
+          ? "OMP still listed running subagents"
+          : "OMP still held running subagents it would not confirm",
+      );
+    }
+    const diagnostic = details.join("; ");
+    this.logger.warn(
+      { turnId, reason: context.reason, diagnostic },
+      "OMP never reported an idle state after ending its response",
+    );
+    // A stall leaves OMP's state unknown, so anything still marked running has no
+    // turn left to finish it.
+    this.terminalizeActiveWork();
+    this.resetActiveTurn();
+    this.usagePoller.stopTurn();
+    this.emit({
+      type: "turn_failed",
+      provider: this.provider,
+      turnId,
+      error: ompStalledTurnMessage(stateUnavailable, subagentsBlocked),
+      code: ompStalledTurnCode(stateUnavailable, subagentsBlocked),
+      diagnostic,
+    });
   }
 
   private async refreshState(): Promise<void> {
@@ -2251,6 +2674,7 @@ export class OmpAgentClient implements AgentClient {
   private readonly modelRoleParams: OmpModelRoleParams;
   private readonly subagentCardScheduler?: OmpSubagentCardScheduler;
   private readonly providerIdleScheduler?: OmpProviderIdleScheduler;
+  private readonly now?: () => number;
   private readonly noTurnScheduler?: OmpNoTurnScheduler;
   private readonly usagePollScheduler?: OmpUsagePollScheduler;
   private readonly runtime: OmpRuntime;
@@ -2274,6 +2698,7 @@ export class OmpAgentClient implements AgentClient {
     this.modelRoleParams = modelRoleParams;
     this.subagentCardScheduler = options.subagentCardScheduler;
     this.providerIdleScheduler = options.providerIdleScheduler;
+    this.now = options.now;
     this.noTurnScheduler = options.noTurnScheduler;
     this.usagePollScheduler = options.usagePollScheduler;
     this.runtime = options.runtime ?? createRuntime(options.logger, runtimeSettings);
@@ -2315,6 +2740,7 @@ export class OmpAgentClient implements AgentClient {
         logger: this.logger,
         subagentCardScheduler: this.subagentCardScheduler,
         providerIdleScheduler: this.providerIdleScheduler,
+        now: this.now,
         noTurnScheduler: this.noTurnScheduler,
         usagePollScheduler: this.usagePollScheduler,
         paseoTools: launchContext?.paseoTools,
@@ -2357,6 +2783,7 @@ export class OmpAgentClient implements AgentClient {
         logger: this.logger,
         subagentCardScheduler: this.subagentCardScheduler,
         providerIdleScheduler: this.providerIdleScheduler,
+        now: this.now,
         noTurnScheduler: this.noTurnScheduler,
         usagePollScheduler: this.usagePollScheduler,
         paseoTools: launchContext?.paseoTools,

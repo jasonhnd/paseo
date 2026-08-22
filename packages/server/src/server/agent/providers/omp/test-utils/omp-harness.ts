@@ -20,7 +20,7 @@ import {
 } from "../agent.js";
 import type { OmpUsagePollScheduler } from "../usage-poller.js";
 import type { OmpAgentMessage, OmpRpcSlashCommand } from "../rpc-types.js";
-import { FakeOmp } from "./fake-omp.js";
+import { FakeOmp, type FakeOmpSubagentSnapshot } from "./fake-omp.js";
 
 const CWD = "/tmp/paseo-omp-agent-test";
 
@@ -69,6 +69,7 @@ export class OmpHarness {
   constructor(
     options: {
       providerIdleScheduler?: OmpProviderIdleScheduler;
+      now?: () => number;
       noTurnScheduler?: OmpNoTurnScheduler;
       usagePollScheduler?: OmpUsagePollScheduler;
     } = {},
@@ -77,6 +78,7 @@ export class OmpHarness {
       logger: pino({ level: "silent" }),
       runtime: this.omp,
       providerIdleScheduler: options.providerIdleScheduler,
+      now: options.now,
       noTurnScheduler: options.noTurnScheduler,
       usagePollScheduler: options.usagePollScheduler,
     });
@@ -247,8 +249,27 @@ export class OmpHarness {
     return { completion: run };
   }
 
+  startAutonomousTurnUntilProviderIdle(
+    output: string,
+    providerState: { isStreaming: boolean; isCompacting: boolean },
+  ): void {
+    const runtime = this.omp.latestSession();
+    runtime.beginTurn();
+    runtime.streamAssistantText(output);
+    runtime.state = { ...runtime.state, ...providerState };
+    runtime.finishTurn();
+  }
+
   waitForProviderStateChecks(count: number): Promise<void> {
     return this.omp.latestSession().waitForStateRequests(count);
+  }
+
+  reportSubagentSnapshots(snapshots: FakeOmpSubagentSnapshot[]): void {
+    this.omp.latestSession().subagents = snapshots;
+  }
+
+  failSubagentSnapshots(error: Error | null): void {
+    this.omp.latestSession().getSubagentsError = error;
   }
 
   reportProviderState(state: { isStreaming: boolean; isCompacting: boolean }): void {
@@ -404,6 +425,10 @@ export class OmpHarness {
       if (event.type === "timeline") items.push(event.item);
     }
     return items;
+  }
+
+  failedTurns(): Array<Extract<AgentStreamEvent, { type: "turn_failed" }>> {
+    return this.events.flatMap((event) => (event.type === "turn_failed" ? [event] : []));
   }
 
   completedTurnCount(): number {

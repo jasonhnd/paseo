@@ -1,8 +1,14 @@
-import { describe, expect, test } from "vitest";
-import { setImmediate as waitForImmediate } from "node:timers/promises";
+import { afterEach, describe, expect, test } from "vitest";
+import { setImmediate as waitForImmediate, setTimeout as delay } from "node:timers/promises";
 
 import type { PaseoToolCatalog } from "../../tools/types.js";
-import type { OmpNoTurnScheduler, OmpProviderIdleScheduler } from "./agent.js";
+import type {
+  OmpNoTurnScheduler,
+  OmpProviderIdleAttempt,
+  OmpProviderIdleDecision,
+  OmpProviderIdleScheduler,
+} from "./agent.js";
+import { createOmpProviderIdleScheduler } from "./agent.js";
 import type { OmpUsagePollScheduler } from "./usage-poller.js";
 import { OmpHarness } from "./test-utils/omp-harness.js";
 
@@ -14,18 +20,68 @@ function lastToolCallStatus(omp: OmpHarness, callId: string): string | undefined
   return last?.type === "tool_call" ? last.status : undefined;
 }
 
+// Every ManualIdleScheduler registers here so a poll after the gate was
+// abandoned fails the test that caused it. Throwing cannot: the gate's promise
+// is consumed by a `.catch()` at the agent_end call site, so a throw would stop
+// the runaway loop silently and the test would still pass.
+const manualIdleSchedulers: ManualIdleScheduler[] = [];
+
+afterEach(() => {
+  const violations = manualIdleSchedulers.flatMap((scheduler) => scheduler.violations());
+  manualIdleSchedulers.length = 0;
+  expect(violations).toEqual([]);
+});
+
 class ManualIdleScheduler implements OmpProviderIdleScheduler {
   private readonly retries: Array<() => void> = [];
   private readonly waiters: Array<{ count: number; resolve: () => void }> = [];
+  private readonly seen: OmpProviderIdleAttempt[] = [];
+  private readonly abandonedPolls: string[] = [];
   private waitCount = 0;
+  private abandoned = false;
 
-  waitForRetry(): Promise<void> {
+  constructor(
+    private readonly decide: (attempt: OmpProviderIdleAttempt) => OmpProviderIdleDecision = () => ({
+      retry: true,
+    }),
+  ) {
+    manualIdleSchedulers.push(this);
+  }
+
+  waitForRetry(attempt: OmpProviderIdleAttempt): Promise<OmpProviderIdleDecision> {
+    if (this.abandoned) {
+      // Recorded, not thrown, and counted before waitCount moves: a violating
+      // poll must not satisfy a waitForWaits() a test is blocked on. Denying
+      // again stops the loop instead of spinning with no timer.
+      // Capped: a runaway loop must report through afterEach rather than
+      // exhausting the worker before the assertion runs.
+      if (this.abandonedPolls.length < 8) {
+        this.abandonedPolls.push(
+          `OMP polled again after the idle scheduler abandoned the gate (attempt ${attempt.attempt})`,
+        );
+      }
+      return Promise.resolve({ retry: false, reason: "wait_budget" });
+    }
     this.waitCount += 1;
+    this.seen.push(attempt);
     for (const waiter of this.waiters.splice(0)) {
       if (this.waitCount >= waiter.count) waiter.resolve();
       else this.waiters.push(waiter);
     }
-    return new Promise((resolve) => this.retries.push(resolve));
+    const decision = this.decide(attempt);
+    if (!decision.retry) {
+      this.abandoned = true;
+      return Promise.resolve(decision);
+    }
+    return new Promise((resolve) => this.retries.push(() => resolve(decision)));
+  }
+
+  violations(): string[] {
+    return this.abandonedPolls;
+  }
+
+  attempts(): OmpProviderIdleAttempt[] {
+    return this.seen;
   }
 
   waitForWaits(count: number): Promise<void> {
@@ -37,6 +93,10 @@ class ManualIdleScheduler implements OmpProviderIdleScheduler {
     const resolve = this.retries.shift();
     if (!resolve) throw new Error("OMP has not requested an idle-state retry");
     resolve();
+  }
+
+  retryAll(): void {
+    for (const resolve of this.retries.splice(0)) resolve();
   }
 }
 
@@ -335,6 +395,361 @@ describe("OMP agent client and session", () => {
     omp.reportProviderState({ isStreaming: false, isCompacting: false });
     scheduler.retry();
     await expect(completion).resolves.toMatchObject({ finalText: "first done" });
+  });
+
+  test("completes once when OMP repeats agent_end for the same turn", async () => {
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    await omp.waitForProviderStateChecks(2);
+    await scheduler.waitForWaits(1);
+
+    // OMP can end a second cycle for the same prompt; the terminal assistant
+    // message it already streamed would otherwise open a second gate.
+    omp.runtime().finishTurn();
+    for (let flush = 0; flush < 5; flush += 1) await waitForImmediate();
+    expect(scheduler.attempts()).toHaveLength(1);
+
+    omp.reportProviderState({ isStreaming: false, isCompacting: false });
+    scheduler.retryAll();
+    await expect(completion).resolves.toMatchObject({ finalText: "first done" });
+    await waitForImmediate();
+    expect(omp.completedTurnCount()).toBe(1);
+  });
+
+  test("fails the turn when OMP never reports idle", async () => {
+    const scheduler = new ManualIdleScheduler((attempt) =>
+      attempt.attempt < 2 ? { retry: true } : { retry: false, reason: "wait_budget" },
+    );
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+    scheduler.retryAll();
+
+    await expect(completion).rejects.toThrow(/idle/i);
+    expect(omp.completedTurnCount()).toBe(0);
+    expect(omp.failedTurns()).toMatchObject([
+      {
+        code: "omp_provider_idle_timeout",
+        diagnostic: expect.stringContaining("isStreaming=true"),
+      },
+    ]);
+  });
+
+  test("fails the turn when OMP state checks keep failing", async () => {
+    const scheduler = new ManualIdleScheduler((attempt) =>
+      attempt.consecutiveFailures < 2
+        ? { retry: true }
+        : { retry: false, reason: "failure_budget" },
+    );
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+    omp.failProviderStateChecks(new Error("state unavailable"));
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+    scheduler.retryAll();
+
+    await expect(completion).rejects.toThrow(/state/i);
+    expect(omp.completedTurnCount()).toBe(0);
+    expect(omp.failedTurns()).toMatchObject([
+      {
+        code: "omp_provider_state_unavailable",
+        diagnostic: expect.stringContaining("state unavailable"),
+      },
+    ]);
+  });
+
+  test("accepts a new prompt after a stalled turn fails", async () => {
+    const scheduler = new ManualIdleScheduler((attempt) =>
+      attempt.attempt < 2 ? { retry: true } : { retry: false, reason: "wait_budget" },
+    );
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+    scheduler.retryAll();
+    await expect(completion).rejects.toThrow(/idle/i);
+
+    omp.reportProviderState({ isStreaming: false, isCompacting: false });
+    await expect(omp.runPrompt("second", "second done")).resolves.toMatchObject({
+      finalText: "second done",
+    });
+  });
+
+  test("completes an autonomous turn once when OMP repeats agent_end", async () => {
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+
+    omp.startAutonomousTurnUntilProviderIdle("autonomous done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+
+    omp.runtime().finishTurn();
+    for (let flush = 0; flush < 5; flush += 1) await waitForImmediate();
+    expect(scheduler.attempts()).toHaveLength(1);
+
+    omp.reportProviderState({ isStreaming: false, isCompacting: false });
+    scheduler.retryAll();
+    for (let flush = 0; flush < 5; flush += 1) await waitForImmediate();
+    expect(omp.completedTurnCount()).toBe(1);
+  });
+
+  test("reports the last OMP state when the idle wait budget expires after a failed check", async () => {
+    const scheduler = new ManualIdleScheduler((attempt) =>
+      attempt.attempt < 3 ? { retry: true } : { retry: false, reason: "wait_budget" },
+    );
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+    omp.failProviderStateChecks(new Error("state unavailable"));
+    scheduler.retryAll();
+    await scheduler.waitForWaits(2);
+    scheduler.retryAll();
+
+    await expect(completion).rejects.toThrow(/idle/i);
+    expect(omp.failedTurns()).toMatchObject([
+      {
+        code: "omp_provider_idle_timeout",
+        diagnostic: expect.stringContaining("isStreaming=true"),
+      },
+    ]);
+    // The failing check is still evidence; it must not be dropped.
+    expect(omp.failedTurns()[0]?.diagnostic).toContain("state unavailable");
+  });
+
+  test("fails the turn with the newest agent_end error", async () => {
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+
+    omp.runtime().finishTurn({ role: "assistant", content: [], errorMessage: "provider exploded" });
+    for (let flush = 0; flush < 5; flush += 1) await waitForImmediate();
+
+    omp.reportProviderState({ isStreaming: false, isCompacting: false });
+    scheduler.retryAll();
+
+    await expect(completion).rejects.toThrow(/provider exploded/);
+    expect(omp.completedTurnCount()).toBe(0);
+  });
+
+  test("the default idle scheduler stops on its wait and failure budgets", async () => {
+    const scheduler = createOmpProviderIdleScheduler();
+
+    await expect(
+      scheduler.waitForRetry({
+        attempt: 1,
+        consecutiveFailures: 0,
+        elapsedMs: 0,
+        totalElapsedMs: 0,
+        isCompacting: false,
+        isWaitingOnSubagents: false,
+      }),
+    ).resolves.toEqual({ retry: true });
+    await expect(
+      scheduler.waitForRetry({
+        attempt: 200,
+        consecutiveFailures: 0,
+        elapsedMs: 60_000,
+        totalElapsedMs: 60_000,
+        isCompacting: false,
+        isWaitingOnSubagents: false,
+      }),
+    ).resolves.toEqual({ retry: false, reason: "wait_budget" });
+    await expect(
+      scheduler.waitForRetry({
+        attempt: 3,
+        consecutiveFailures: 3,
+        elapsedMs: 100,
+        totalElapsedMs: 100,
+        isCompacting: false,
+        isWaitingOnSubagents: false,
+      }),
+    ).resolves.toEqual({ retry: false, reason: "failure_budget" });
+  });
+
+  test("cancels in-flight tool calls when a turn stalls", async () => {
+    const scheduler = new ManualIdleScheduler((attempt) =>
+      attempt.attempt < 2 ? { retry: true } : { retry: false, reason: "wait_budget" },
+    );
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    omp.runtime().emit({
+      type: "tool_execution_start",
+      toolCallId: "tool-1",
+      toolName: "bash",
+      args: { command: "sleep 30" },
+    });
+    expect(omp.runningToolCallIds()).toEqual(["tool-1"]);
+
+    await scheduler.waitForWaits(1);
+    scheduler.retryAll();
+    await expect(completion).rejects.toThrow(/idle/i);
+
+    expect(omp.runningToolCallIds()).toEqual([]);
+  });
+
+  test("does not fail a turn that started after the gate was abandoned", async () => {
+    // The deny lands after ownership has moved on: get_state and waitForRetry are
+    // both awaits, so the turn can change under a parked gate.
+    let releaseDeny!: () => void;
+    let gateParked!: () => void;
+    const parked = new Promise<void>((resolve) => {
+      gateParked = resolve;
+    });
+    const scheduler: OmpProviderIdleScheduler = {
+      waitForRetry: () => {
+        gateParked();
+        return new Promise((resolve) => {
+          releaseDeny = () => resolve({ retry: false, reason: "wait_budget" });
+        });
+      },
+    };
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    await parked;
+
+    // The user gives up on the stuck turn and sends another one.
+    await omp.interrupt();
+    await completion;
+    omp.reportProviderState({ isStreaming: false, isCompacting: false });
+    await omp.requireStartTurn("second");
+
+    releaseDeny();
+    for (let flush = 0; flush < 5; flush += 1) await waitForImmediate();
+
+    expect(omp.failedTurns()).toEqual([]);
+    const runtime = omp.runtime();
+    runtime.beginTurn();
+    runtime.streamAssistantText("second done");
+    runtime.finishTurn();
+    for (let flush = 0; flush < 5; flush += 1) await waitForImmediate();
+    expect(omp.completedTurnCount()).toBe(1);
+  });
+
+  test("keeps polling past the idle budget while OMP reports compacting", async () => {
+    const scheduler = createOmpProviderIdleScheduler();
+
+    await expect(
+      scheduler.waitForRetry({
+        attempt: 1,
+        consecutiveFailures: 0,
+        elapsedMs: 120_000,
+        totalElapsedMs: 120_000,
+        isCompacting: true,
+        isWaitingOnSubagents: false,
+      }),
+    ).resolves.toEqual({ retry: true });
+    await expect(
+      scheduler.waitForRetry({
+        attempt: 1,
+        consecutiveFailures: 0,
+        elapsedMs: 120_000,
+        totalElapsedMs: 120_000,
+        isCompacting: false,
+        isWaitingOnSubagents: false,
+      }),
+    ).resolves.toEqual({ retry: false, reason: "wait_budget" });
+  });
+
+  test("reports the observed compaction state and elapsed time to the scheduler", async () => {
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+
+    await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: false,
+      isCompacting: true,
+    });
+    await scheduler.waitForWaits(1);
+    expect(scheduler.attempts()[0]?.isCompacting).toBe(true);
+
+    await delay(5);
+    scheduler.retryAll();
+    await scheduler.waitForWaits(2);
+    expect(scheduler.attempts()[1]?.elapsedMs).toBeGreaterThanOrEqual(5);
+  });
+
+  test("keeps an earlier agent_end error when a later cycle reports none", async () => {
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+
+    omp.runtime().finishTurn({ role: "assistant", content: [], errorMessage: "provider exploded" });
+    omp.runtime().finishTurn();
+    for (let flush = 0; flush < 5; flush += 1) await waitForImmediate();
+
+    omp.reportProviderState({ isStreaming: false, isCompacting: false });
+    scheduler.retryAll();
+
+    await expect(completion).rejects.toThrow(/provider exploded/);
+  });
+
+  test("reports an unavailable state path when no OMP state was ever observed", async () => {
+    const scheduler = new ManualIdleScheduler((attempt) =>
+      attempt.attempt < 2 ? { retry: true } : { retry: false, reason: "wait_budget" },
+    );
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+    omp.failProviderStateChecks(new Error("state unavailable"));
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+    scheduler.retryAll();
+
+    await expect(completion).rejects.toThrow(/state/i);
+    expect(omp.failedTurns()).toMatchObject([{ code: "omp_provider_state_unavailable" }]);
+    expect(omp.failedTurns()[0]?.diagnostic).toContain("2 consecutive failures");
   });
 
   // #2232: parent model loop can go idle while OMP-internal `task` children
@@ -659,6 +1074,525 @@ describe("OMP agent client and session", () => {
     });
     expect(lastToolCallStatus(omp, "task-fail")).toBe("failed");
     expect(omp.runningToolCallIds()).toEqual([]);
+  });
+
+  test("waits past the idle budget while OMP reports running subagents", async () => {
+    const scheduler = createOmpProviderIdleScheduler();
+
+    await expect(
+      scheduler.waitForRetry({
+        attempt: 1,
+        consecutiveFailures: 0,
+        elapsedMs: 120_000,
+        totalElapsedMs: 120_000,
+        isCompacting: false,
+        isWaitingOnSubagents: true,
+      }),
+    ).resolves.toEqual({ retry: true });
+  });
+
+  test("stops trusting a subagent wait once get_subagents stops answering", async () => {
+    let clock = 0;
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler, now: () => clock });
+    await omp.start();
+
+    omp.reportSubagentSnapshots([{ id: "child-1", index: 0, agent: "worker", status: "running" }]);
+    const { completion } = await omp.startPromptUntilProviderIdle("fan out", "dispatched", {
+      isStreaming: false,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+
+    // A snapshot that cannot be fetched is not evidence that work continues, so
+    // the clock keeps running even though the gate still waits on the child.
+    omp.failSubagentSnapshots(new Error("subagents unavailable"));
+    clock += 120_000;
+    scheduler.retryAll();
+    await scheduler.waitForWaits(2);
+    expect(scheduler.attempts()[1]?.isWaitingOnSubagents).toBe(true);
+    expect(scheduler.attempts()[1]?.elapsedMs).toBeGreaterThanOrEqual(120_000);
+    void completion;
+  });
+
+  test("does not let an unconfirmed subagent hold the clock open", async () => {
+    let clock = 0;
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler, now: () => clock });
+    await omp.start();
+
+    await omp.requireStartTurn("fan out");
+    const runtime = omp.runtime();
+    runtime.beginTurn();
+    runtime.acceptPrompt("fan out", "user-fan");
+    runtime.streamAssistantText("dispatching");
+    // A lifecycle child that no get_subagents reply ever lists: the gate still
+    // waits on it, but OMP has never confirmed it is doing anything.
+    runtime.emit({
+      type: "subagent_lifecycle",
+      payload: { id: "child-1", agent: "worker", status: "started", index: 0 },
+    });
+    runtime.state = { ...runtime.state, isStreaming: false, isCompacting: false };
+    runtime.finishTurn();
+
+    await scheduler.waitForWaits(1);
+    expect(scheduler.attempts()[0]?.isWaitingOnSubagents).toBe(true);
+    clock += 90_000;
+    scheduler.retryAll();
+    await scheduler.waitForWaits(2);
+    expect(scheduler.attempts()[1]?.elapsedMs).toBeGreaterThanOrEqual(90_000);
+  });
+
+  test("does not credit progress when get_state fails", async () => {
+    let clock = 0;
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler, now: () => clock });
+    await omp.start();
+
+    omp.reportSubagentSnapshots([{ id: "child-1", index: 0, agent: "worker", status: "running" }]);
+    const { completion } = await omp.startPromptUntilProviderIdle("fan out", "dispatched", {
+      isStreaming: false,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+
+    // With get_state down there is no fresh subagent reply either, so the last
+    // confirmation must not keep restarting the clock.
+    omp.failProviderStateChecks(new Error("state unavailable"));
+    clock += 120_000;
+    scheduler.retryAll();
+    await scheduler.waitForWaits(2);
+    expect(scheduler.attempts()[1]?.elapsedMs).toBeGreaterThanOrEqual(120_000);
+    void completion;
+  });
+
+  test("names unconfirmed subagents when the gate gives up waiting on them", async () => {
+    const scheduler = new ManualIdleScheduler((attempt) =>
+      attempt.attempt < 2 ? { retry: true } : { retry: false, reason: "wait_budget" },
+    );
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+
+    omp.reportSubagentSnapshots([{ id: "child-1", index: 0, agent: "worker", status: "running" }]);
+    const { completion } = await omp.startPromptUntilProviderIdle("fan out", "dispatched", {
+      isStreaming: false,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+
+    // The snapshot path goes down while the index still holds a running child.
+    omp.failSubagentSnapshots(new Error("subagents unavailable"));
+    scheduler.retryAll();
+
+    await expect(completion).rejects.toThrow(/subagent/i);
+    expect(omp.failedTurns()[0]?.diagnostic).toContain("running subagents");
+  });
+
+  test("does not claim consecutive failures when the last state check succeeded", async () => {
+    const scheduler = new ManualIdleScheduler((attempt) =>
+      attempt.attempt < 3 ? { retry: true } : { retry: false, reason: "wait_budget" },
+    );
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+    omp.failProviderStateChecks(new Error("state unavailable"));
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+    omp.failProviderStateChecks(null);
+    scheduler.retryAll();
+    await scheduler.waitForWaits(2);
+    scheduler.retryAll();
+
+    await expect(completion).rejects.toThrow();
+    const diagnostic = omp.failedTurns()[0]?.diagnostic ?? "";
+    expect(diagnostic).toContain("state unavailable");
+    expect(diagnostic).not.toContain("consecutive failures");
+  });
+
+  test("does not spend the idle budget while OMP is still emitting events", async () => {
+    let clock = 0;
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler, now: () => clock });
+    await omp.start();
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+
+    // OMP streams a second cycle for the same prompt: slow, but demonstrably
+    // alive. Silence is the stall this budget is for, not elapsed time.
+    clock += 90_000;
+    omp.runtime().streamAssistantText("still working");
+    scheduler.retryAll();
+    await scheduler.waitForWaits(2);
+    expect(scheduler.attempts()[1]?.elapsedMs).toBeLessThan(60_000);
+
+    // Now it goes quiet.
+    clock += 90_000;
+    scheduler.retryAll();
+    await scheduler.waitForWaits(3);
+    expect(scheduler.attempts()[2]?.elapsedMs).toBeGreaterThanOrEqual(90_000);
+    void completion;
+  });
+
+  test("keeps spending the budget while the reported state oscillates", async () => {
+    let clock = 0;
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler, now: () => clock });
+    await omp.start();
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+
+    // A flag flipping back and forth is not progress, so each budget keeps its
+    // own accrued silence instead of being reset by the change.
+    for (let round = 0; round < 4; round += 1) {
+      clock += 60_000;
+      omp.reportProviderState({
+        isStreaming: round % 2 === 0,
+        isCompacting: round % 2 === 1,
+      });
+      scheduler.retryAll();
+      await scheduler.waitForWaits(round + 2);
+    }
+    const stallSilence = scheduler
+      .attempts()
+      .filter((attempt) => !attempt.isCompacting)
+      .map((attempt) => attempt.elapsedMs);
+    expect(stallSilence.at(-1)).toBeGreaterThanOrEqual(120_000);
+    void completion;
+  });
+
+  test("reports the live subagent state when the gate gives up", async () => {
+    const scheduler = new ManualIdleScheduler((attempt) =>
+      attempt.attempt < 3 ? { retry: true } : { retry: false, reason: "wait_budget" },
+    );
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler, now: () => 0 });
+    await omp.start();
+
+    omp.reportSubagentSnapshots([{ id: "child-1", index: 0, agent: "worker", status: "running" }]);
+    const { completion } = await omp.startPromptUntilProviderIdle("fan out", "dispatched", {
+      isStreaming: false,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+
+    // The child reports done, then the parent stalls with nothing running.
+    omp.runtime().emit({
+      type: "subagent_lifecycle",
+      payload: { id: "child-1", agent: "worker", status: "completed", index: 0 },
+    });
+    omp.reportProviderState({ isStreaming: true, isCompacting: false });
+    scheduler.retryAll();
+    await scheduler.waitForWaits(2);
+    scheduler.retryAll();
+
+    await expect(completion).rejects.toThrow(/idle state/);
+    expect(omp.failedTurns()).toMatchObject([{ code: "omp_provider_idle_timeout" }]);
+    expect(omp.failedTurns()[0]?.diagnostic).not.toContain("subagents");
+  });
+
+  test("does not complete a turn the gate no longer owns", async () => {
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+
+    // Park the gate inside get_state, which carries the RPC timeout, and let the
+    // turn change while it is in there.
+    omp.reportProviderState({ isStreaming: false, isCompacting: false });
+    omp.runtime().holdStateChecks = true;
+    scheduler.retryAll();
+    await omp.waitForProviderStateChecks(2);
+    await omp.interrupt();
+    await completion;
+    const completedAfterCancel = omp.completedTurnCount();
+
+    omp.runtime().releaseStateChecks();
+    for (let flush = 0; flush < 5; flush += 1) await waitForImmediate();
+    expect(omp.completedTurnCount()).toBe(completedAfterCancel);
+  });
+
+  test("does not charge compaction silence to the stall budget when compaction ends", async () => {
+    let clock = 0;
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler, now: () => clock });
+    await omp.start();
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: false,
+      isCompacting: true,
+    });
+    await scheduler.waitForWaits(1);
+
+    // Three silent minutes of auto-compaction, well inside its own budget.
+    clock += 180_000;
+    scheduler.retryAll();
+    await scheduler.waitForWaits(2);
+    expect(scheduler.attempts()[1]?.isCompacting).toBe(true);
+
+    // Compaction ends and the model resumes before emitting its first token.
+    omp.reportProviderState({ isStreaming: true, isCompacting: false });
+    scheduler.retryAll();
+    await scheduler.waitForWaits(3);
+    expect(scheduler.attempts()[2]?.isCompacting).toBe(false);
+    expect(scheduler.attempts()[2]?.elapsedMs).toBeLessThan(60_000);
+    expect(omp.failedTurns()).toEqual([]);
+    void completion;
+  });
+
+  test("does not treat an unchanging subagent snapshot as progress", async () => {
+    let clock = 0;
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler, now: () => clock });
+    await omp.start();
+
+    omp.reportSubagentSnapshots([
+      { id: "child-1", index: 0, agent: "worker", status: "running", lastUpdate: 1 },
+    ]);
+    const { completion } = await omp.startPromptUntilProviderIdle("fan out", "dispatched", {
+      isStreaming: false,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+
+    // The same reply, over and over, is a stuck child rather than a working one.
+    for (let round = 0; round < 3; round += 1) {
+      clock += 120_000;
+      scheduler.retryAll();
+      await scheduler.waitForWaits(round + 2);
+    }
+    expect(scheduler.attempts()[3]?.isWaitingOnSubagents).toBe(true);
+    expect(scheduler.attempts()[3]?.elapsedMs).toBeGreaterThanOrEqual(240_000);
+    void completion;
+  });
+
+  test("counts a moving subagent snapshot as progress", async () => {
+    let clock = 0;
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler, now: () => clock });
+    await omp.start();
+
+    omp.reportSubagentSnapshots([
+      { id: "child-1", index: 0, agent: "worker", status: "running", lastUpdate: 1 },
+    ]);
+    const { completion } = await omp.startPromptUntilProviderIdle("fan out", "dispatched", {
+      isStreaming: false,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+
+    clock += 120_000;
+    omp.reportSubagentSnapshots([
+      { id: "child-1", index: 0, agent: "worker", status: "running", lastUpdate: 2 },
+    ]);
+    scheduler.retryAll();
+    await scheduler.waitForWaits(2);
+    clock += 1_000;
+    scheduler.retryAll();
+    await scheduler.waitForWaits(3);
+    expect(scheduler.attempts()[2]?.elapsedMs).toBeLessThan(120_000);
+    void completion;
+  });
+
+  test("counts a subagent progress frame as progress", async () => {
+    let clock = 0;
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler, now: () => clock });
+    await omp.start();
+
+    await omp.requireStartTurn("fan out");
+    const runtime = omp.runtime();
+    runtime.beginTurn();
+    runtime.acceptPrompt("fan out", "user-fan");
+    runtime.streamAssistantText("dispatching");
+    runtime.emit({
+      type: "subagent_lifecycle",
+      payload: { id: "child-1", agent: "worker", status: "started", index: 0 },
+    });
+    runtime.state = { ...runtime.state, isStreaming: false, isCompacting: false };
+    runtime.finishTurn();
+    // Legacy OMP: no snapshot path, only narration.
+    omp.failSubagentSnapshots(new Error("unknown command get_subagents"));
+    await scheduler.waitForWaits(1);
+
+    clock += 120_000;
+    runtime.emit({
+      type: "subagent_progress",
+      payload: {
+        id: "child-1",
+        agent: "worker",
+        index: 0,
+        progress: { id: "child-1", status: "running" },
+      },
+    });
+    scheduler.retryAll();
+    await scheduler.waitForWaits(2);
+    expect(scheduler.attempts()[1]?.elapsedMs).toBeLessThan(120_000);
+  });
+
+  test("stops reporting a subagent wait once the child reports done", async () => {
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+
+    omp.reportSubagentSnapshots([{ id: "child-1", index: 0, agent: "worker", status: "running" }]);
+    const { completion } = await omp.startPromptUntilProviderIdle("fan out", "dispatched", {
+      isStreaming: false,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+    expect(scheduler.attempts()[0]?.isWaitingOnSubagents).toBe(true);
+
+    omp.runtime().emit({
+      type: "subagent_lifecycle",
+      payload: { id: "child-1", agent: "worker", status: "completed", index: 0 },
+    });
+    // The model goes busy, so the gate cannot re-poll get_subagents.
+    omp.reportProviderState({ isStreaming: true, isCompacting: false });
+    scheduler.retryAll();
+    await scheduler.waitForWaits(2);
+    expect(scheduler.attempts()[1]?.isWaitingOnSubagents).toBe(false);
+    void completion;
+  });
+
+  test("gives up on a stalled turn even while OMP keeps chattering", async () => {
+    let clock = 0;
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler, now: () => clock });
+    await omp.start();
+
+    const { completion } = await omp.startPromptUntilProviderIdle("first", "first done", {
+      isStreaming: true,
+      isCompacting: false,
+    });
+    await scheduler.waitForWaits(1);
+
+    // Host-level chatter is not the turn advancing, and even if it were, the
+    // gate must not outlive its ceiling.
+    for (let round = 0; round < 6; round += 1) {
+      clock += 600_000;
+      omp.runtime().emit({ type: "notice", level: "info", message: "mcp server reloaded" });
+      scheduler.retryAll();
+      await scheduler.waitForWaits(round + 2);
+    }
+    const last = scheduler.attempts().at(-1);
+    expect(last?.elapsedMs).toBeGreaterThanOrEqual(600_000);
+    expect(last?.totalElapsedMs).toBeGreaterThanOrEqual(3_600_000);
+    void completion;
+  });
+
+  test("the default idle scheduler stops at the ceiling whatever the class", async () => {
+    const scheduler = createOmpProviderIdleScheduler();
+
+    await expect(
+      scheduler.waitForRetry({
+        attempt: 1,
+        consecutiveFailures: 0,
+        elapsedMs: 0,
+        totalElapsedMs: 3_600_000,
+        isCompacting: true,
+        isWaitingOnSubagents: true,
+      }),
+    ).resolves.toEqual({ retry: false, reason: "wait_budget" });
+  });
+
+  test("counts a running tool call as outstanding work", async () => {
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+
+    await omp.requireStartTurn("run something slow");
+    const runtime = omp.runtime();
+    runtime.beginTurn();
+    runtime.acceptPrompt("run something slow", "user-1");
+    runtime.streamAssistantText("running");
+    runtime.emit({
+      type: "tool_execution_start",
+      toolCallId: "tool-1",
+      toolName: "bash",
+      args: { command: "sleep 600" },
+    });
+    runtime.state = { ...runtime.state, isStreaming: true, isCompacting: false };
+    runtime.finishTurn();
+
+    await scheduler.waitForWaits(1);
+    expect(scheduler.attempts()[0]?.isWaitingOnSubagents).toBe(true);
+  });
+
+  test("does not count a tool call left over from an earlier turn", async () => {
+    const scheduler = new ManualIdleScheduler();
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler });
+    await omp.start();
+
+    // Turn one leaks a tool call: OMP never sends its tool_execution_end.
+    await omp.requireStartTurn("first");
+    const runtime = omp.runtime();
+    runtime.beginTurn();
+    runtime.acceptPrompt("first", "user-1");
+    runtime.emit({
+      type: "tool_execution_start",
+      toolCallId: "orphan-1",
+      toolName: "bash",
+      args: { command: "sleep 1" },
+    });
+    runtime.streamAssistantText("first done");
+    runtime.state = { ...runtime.state, isStreaming: false, isCompacting: false };
+    runtime.finishTurn();
+    for (let flush = 0; flush < 5; flush += 1) await waitForImmediate();
+
+    await omp.requireStartTurn("second");
+    runtime.beginTurn();
+    runtime.acceptPrompt("second", "user-2");
+    runtime.streamAssistantText("second running");
+    runtime.state = { ...runtime.state, isStreaming: true, isCompacting: false };
+    runtime.finishTurn();
+
+    await scheduler.waitForWaits(1);
+    expect(scheduler.attempts()[0]?.isWaitingOnSubagents).toBe(false);
+  });
+
+  test("does not describe finished children as a subagent stall", async () => {
+    const scheduler = new ManualIdleScheduler((attempt) =>
+      attempt.attempt < 2 ? { retry: true } : { retry: false, reason: "wait_budget" },
+    );
+    const omp = new OmpHarness({ providerIdleScheduler: scheduler, now: () => 0 });
+    await omp.start();
+
+    // A reply listing only finished children names nothing still going.
+    omp.reportSubagentSnapshots([
+      { id: "child-1", index: 0, agent: "worker", status: "completed" },
+    ]);
+    await omp.requireStartTurn("fan out");
+    const runtime = omp.runtime();
+    runtime.beginTurn();
+    runtime.acceptPrompt("fan out", "user-fan");
+    runtime.streamAssistantText("dispatching");
+    runtime.emit({
+      type: "subagent_lifecycle",
+      payload: { id: "child-2", agent: "worker", status: "started", index: 1 },
+    });
+    runtime.state = { ...runtime.state, isStreaming: false, isCompacting: false };
+    runtime.finishTurn();
+
+    await scheduler.waitForWaits(1);
+    scheduler.retryAll();
+    await waitForImmediate();
+
+    expect(omp.failedTurns()[0]?.diagnostic).toContain("would not confirm");
   });
 
   test("does not complete on OMP's extension-notice agent_end", async () => {

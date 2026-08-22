@@ -252,6 +252,9 @@ export class FakeOmpSession implements OmpRuntimeSession {
       if (this.getStateRequestCount >= waiter.count) waiter.resolve();
       else this.stateRequestWaiters.push(waiter);
     }
+    if (this.holdStateChecks) {
+      await new Promise<void>((resolve) => this.heldStateChecks.push(resolve));
+    }
     if (this.getStateError) {
       throw this.getStateError;
     }
@@ -264,6 +267,13 @@ export class FakeOmpSession implements OmpRuntimeSession {
 
   queueStateReports(states: OmpSessionState[]): void {
     this.stateReports.push(...states);
+  }
+
+  holdStateChecks = false;
+  private readonly heldStateChecks: Array<() => void> = [];
+
+  releaseStateChecks(): void {
+    for (const resolve of this.heldStateChecks.splice(0)) resolve();
   }
 
   waitForStateRequests(count: number): Promise<void> {
